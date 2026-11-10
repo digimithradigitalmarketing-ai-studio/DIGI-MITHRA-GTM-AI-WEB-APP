@@ -99,7 +99,8 @@ insert into public.pipeline_stages (id, tenant_id, workspace_id, name, "position
   ('e2000000-0000-4000-8000-00000000b101', 'b1000000-0000-4000-8000-00000000000b', 'b2000000-0000-4000-8000-0000000000b1', 'Open B1', 1, false, false);
 
 -- W1: the live follow-up workflow. One create_task node, then end.
--- W3: a draft with two create_task nodes. Node 2 fails on purpose ('soon' is not an integer).
+-- W3: a draft with two nodes. Node 2 is valid to save but fails at run time on purpose: set_priority
+-- casts the payload's conversation_id, and the T3 run passes a value that is not a uuid.
 -- WB: tenant B's own workflow, used to show that B can still run its own workflows.
 insert into public.workflows (id, tenant_id, workspace_id, name, trigger_type, status, definition) values
   ('a3000000-0000-4000-8000-0000000000a1', 'a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1',
@@ -107,7 +108,7 @@ insert into public.workflows (id, tenant_id, workspace_id, name, trigger_type, s
    '{"nodes":[{"type":"create_task","config":{"title":"Follow up with {{name}}","due_in_hours":24,"priority":"high"}},{"type":"end"}]}'),
   ('a3000000-0000-4000-8000-0000000000a3', 'a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1',
    'Two-step follow-up', 'lead_created', 'draft',
-   '{"nodes":[{"type":"create_task","config":{"title":"Call {{name}}","due_in_hours":24}},{"type":"create_task","config":{"title":"Second touch","due_in_hours":"soon"}},{"type":"end"}]}'),
+   '{"nodes":[{"type":"create_task","config":{"title":"Call {{name}}","due_in_hours":24}},{"type":"set_priority","config":{"priority":"high"}},{"type":"end"}]}'),
   ('b3000000-0000-4000-8000-0000000000b1', 'b1000000-0000-4000-8000-00000000000b', 'b2000000-0000-4000-8000-0000000000b1',
    'Tenant B follow-up', 'lead_created', 'active',
    '{"nodes":[{"type":"create_task","config":{"title":"B follow up"}},{"type":"end"}]}');
@@ -131,6 +132,21 @@ select pg_temp.assert_ok('P4 workflow tables have row level security enabled',
                   'public.workflow_steps'::regclass, 'public.workflow_versions'::regclass)));
 select pg_temp.assert_ok('P5 the automation key uniqueness index exists',
   to_regclass('public.tasks_automation_key_uniq') is not null);
+select pg_temp.assert_ok('P6 the one-retry-per-run unique index exists',
+  to_regclass('public.workflow_runs_one_retry_uniq') is not null);
+-- Matches production's ACL for the two run controls: authenticated and service_role, nothing else.
+select pg_temp.assert_ok('P7 service_role can execute the run controls and retry',
+  has_function_privilege('service_role', 'public.run_workflow_test(uuid, jsonb)', 'execute')
+  and has_function_privilege('service_role', 'public.cancel_workflow_run(uuid)', 'execute')
+  and has_function_privilege('service_role', 'public.retry_workflow_run(uuid)', 'execute'));
+select pg_temp.assert_ok('P8 no PUBLIC or anon execute on the run controls or retry',
+  not exists (
+    select 1 from pg_proc p,
+         lateral aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+     where p.oid in ('public.run_workflow_test(uuid, jsonb)'::regprocedure,
+                     'public.cancel_workflow_run(uuid)'::regprocedure,
+                     'public.retry_workflow_run(uuid)'::regprocedure)
+       and (a.grantee = 0 or pg_get_userbyid(a.grantee) = 'anon')));
 
 -- ----------------------------------------------------------------- 1. one lead event, one task
 -- The lead trigger fires the active workflow. Its create_task node makes one follow-up task.
@@ -189,7 +205,8 @@ insert into public.leads (id, tenant_id, workspace_id, stage_id, title, value_in
 select pg_temp.act_as(
   'a0000000-0000-4000-8000-00000000a002');
 select public.run_workflow_test('a3000000-0000-4000-8000-0000000000a3'::uuid,
-  jsonb_build_object('lead_id', 'a4000000-0000-4000-8000-00000000a002', 'name', 'Lead two'));
+  jsonb_build_object('lead_id', 'a4000000-0000-4000-8000-00000000a002', 'name', 'Lead two',
+                     'conversation_id', 'not-a-uuid'));
 
 select pg_temp.act_as_postgres();
 insert into ids select 'failed_w3', id from public.workflow_runs
@@ -243,6 +260,45 @@ select pg_temp.expect_sqlstate('R2 a completed run cannot be retried', '22023', 
 $q$);
 select pg_temp.expect_sqlstate('R3 an unknown run is reported as not found', 'P0002',
   $q$select public.retry_workflow_run('00000000-0000-4000-8000-0000000000ff'::uuid)$q$);
+
+-- Concurrency backstop. Even if a second child row is written directly, the unique index refuses it.
+select pg_temp.act_as_postgres();
+select pg_temp.expect_sqlstate('R3b a second retry row for the same run violates the unique index', '23505', $q$
+  insert into public.workflow_runs (tenant_id, workspace_id, workflow_id, version, trigger_payload, dedupe_key, status, retry_of, attempt)
+  select tenant_id, workspace_id, workflow_id, version, trigger_payload, 'dup-child-r3b', 'failed', id, 2
+    from public.workflow_runs where id = (select v from pg_temp.ids where k = 'failed_w3')
+$q$);
+
+-- ----------------------------------------------------------------- 3b. retry of a retry
+-- The first retry (retry_w3) fails. The owner marks it failed, as a real failure would leave it.
+select pg_temp.assert_ok('T3i the first retry can be marked failed for the retry-of-retry check',
+  pg_temp.affected($q$
+    update public.workflow_runs set status = 'failed', error = 'simulated failure', finished_at = now()
+     where id = (select v from pg_temp.ids where k = 'retry_w3')
+  $q$) = 1);
+
+select pg_temp.act_as('a0000000-0000-4000-8000-00000000a002');
+select public.retry_workflow_run((select v from ids where k = 'retry_w3'));
+
+select pg_temp.act_as_postgres();
+insert into ids select 'retry2_w3', id from public.workflow_runs
+ where retry_of = (select v from ids where k = 'retry_w3');
+
+select pg_temp.assert_ok('T3j the retry of a retry is attempt 3 and links to the failed retry',
+  (select count(*) from public.workflow_runs r join ids on ids.k = 'retry2_w3' and r.id = ids.v
+    where r.retry_of = (select v from ids where k = 'retry_w3') and r.attempt = 3 and r.status = 'completed') = 1);
+select pg_temp.assert_ok('T3k the second retry creates no duplicate task',
+  (select count(*) from public.tasks
+    where automation_key like 'wf:a3000000-0000-4000-8000-0000000000a3:evt:a4000000-0000-4000-8000-00000000a002:%') = 2);
+
+select pg_temp.act_as('a0000000-0000-4000-8000-00000000a002');
+select pg_temp.expect_sqlstate('R4 a run that already has a retry cannot be retried again, even if it failed', '22023',
+  $q$select public.retry_workflow_run((select v from pg_temp.ids where k = 'retry_w3'))$q$);
+select pg_temp.expect_sqlstate('R5 a completed retry cannot be retried', '22023',
+  $q$select public.retry_workflow_run((select v from pg_temp.ids where k = 'retry2_w3'))$q$);
+select pg_temp.expect_sqlstate('R6 the original failed run is still refused after the chain grew', '22023',
+  $q$select public.retry_workflow_run((select v from pg_temp.ids where k = 'failed_w3'))$q$);
+select pg_temp.act_as_postgres();
 
 -- ----------------------------------------------------------------- 4. tenant isolation (tenant B)
 select pg_temp.act_as('b0000000-0000-4000-8000-00000000b001');
@@ -372,6 +428,86 @@ select pg_temp.assert_ok('V5 the rejected edit left the live definition unchange
     where id = 'a3000000-0000-4000-8000-0000000000a1'
       and definition->'nodes'->0->>'type' = 'create_task') = 1);
 
+-- Malformed node configuration is refused at save time, with the node named in the message.
+select pg_temp.act_as_postgres();
+select pg_temp.expect_sqlstate('V6 a text due_in_hours is rejected', '22023', $q$
+  insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+  values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Bad', 'lead_created', 'draft',
+          '{"nodes":[{"type":"create_task","config":{"due_in_hours":"soon"}}]}')
+$q$);
+select pg_temp.expect_sqlstate('V7 a config that is not an object is rejected', '22023', $q$
+  insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+  values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Bad', 'lead_created', 'draft',
+          '{"nodes":[{"type":"create_task","config":"24h"}]}')
+$q$);
+select pg_temp.expect_sqlstate('V8 an add_tag node without a tag is rejected', '22023', $q$
+  insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+  values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Bad', 'lead_created', 'draft',
+          '{"nodes":[{"type":"add_tag","config":{"tag":"   "}}]}')
+$q$);
+select pg_temp.expect_sqlstate('V9 due_in_hours of zero is rejected', '22023', $q$
+  insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+  values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Bad', 'lead_created', 'draft',
+          '{"nodes":[{"type":"create_task","config":{"due_in_hours":0}}]}')
+$q$);
+select pg_temp.expect_sqlstate('V10 due_in_hours above 720 is rejected', '22023', $q$
+  insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+  values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Bad', 'lead_created', 'draft',
+          '{"nodes":[{"type":"create_task","config":{"due_in_hours":721}}]}')
+$q$);
+select pg_temp.expect_sqlstate('V11 a fractional due_in_hours is rejected', '22023', $q$
+  insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+  values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Bad', 'lead_created', 'draft',
+          '{"nodes":[{"type":"create_task","config":{"due_in_hours":1.5}}]}')
+$q$);
+select pg_temp.expect_sqlstate('V12 an unknown priority is rejected', '22023', $q$
+  insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+  values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Bad', 'lead_created', 'draft',
+          '{"nodes":[{"type":"set_priority","config":{"priority":"critical"}}]}')
+$q$);
+select pg_temp.expect_sqlstate('V13 an unknown condition operator is rejected', '22023', $q$
+  insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+  values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Bad', 'lead_created', 'draft',
+          '{"nodes":[{"type":"condition","config":{"operator":"starts_with","value":"x"}}]}')
+$q$);
+select pg_temp.expect_sqlstate('V14 a node that is not an object is rejected', '22023', $q$
+  insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+  values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Bad', 'lead_created', 'draft',
+          '{"nodes":["end"]}')
+$q$);
+select pg_temp.expect_sqlstate('V15 a description over 500 characters is rejected', '22023', $q$
+  insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+  values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Bad', 'lead_created', 'draft',
+          jsonb_build_object('nodes', jsonb_build_array(jsonb_build_object('type', 'create_task',
+            'config', jsonb_build_object('description', repeat('x', 501))))))
+$q$);
+select pg_temp.expect_sqlstate('V16 more than 25 nodes is rejected', '22023', $q$
+  insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+  values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Bad', 'lead_created', 'draft',
+          jsonb_build_object('nodes', (select jsonb_agg(jsonb_build_object('type', 'wait')) from generate_series(1, 26))))
+$q$);
+select pg_temp.assert_ok('V17 the boundary values are accepted (720 hours, urgent, a 25-node limit)',
+  pg_temp.affected($q$
+    insert into public.workflows (tenant_id, workspace_id, name, trigger_type, status, definition)
+    values ('a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1', 'Edge', 'lead_created', 'draft',
+            '{"nodes":[{"type":"create_task","config":{"due_in_hours":720,"priority":"urgent","title":"Edge"}},{"type":"add_tag","config":{"tag":"vip"}},{"type":"end"}]}')
+  $q$) = 1);
+
+-- A status-only change never re-validates the definition. A row that predates the check (planted here with
+-- the trigger off, as a migration or a restore could leave it) can still be paused, but any new
+-- definition for it must pass.
+select pg_temp.act_as_postgres();
+alter table public.workflows disable trigger trg_validate_definition;
+insert into public.workflows (id, tenant_id, workspace_id, name, trigger_type, status, definition) values
+  ('a3000000-0000-4000-8000-0000000000e1', 'a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1',
+   'Legacy', 'lead_created', 'active', '{"nodes":[{"type":"add_tag","config":{}}]}');
+alter table public.workflows enable trigger trg_validate_definition;
+select pg_temp.assert_ok('V18 a legacy invalid row can still be paused (status-only edit)',
+  pg_temp.affected($q$ update public.workflows set status = 'paused' where id = 'a3000000-0000-4000-8000-0000000000e1' $q$) = 1);
+select pg_temp.expect_sqlstate('V19 an edit to a legacy row must pass the check', '22023', $q$
+  update public.workflows set definition = '{"nodes":[{"type":"add_tag","config":{}}]}' where id = 'a3000000-0000-4000-8000-0000000000e1'
+$q$);
+
 -- ----------------------------------------------------------------- 9. existing CRM still works
 -- An editor creates a lead and manual tasks through the normal CRM path.
 select pg_temp.act_as('a0000000-0000-4000-8000-00000000a003');
@@ -406,5 +542,17 @@ select pg_temp.assert_ok('C5 the manual tasks are not counted as automation task
 select pg_temp.act_as('a0000000-0000-4000-8000-00000000a002');
 select pg_temp.assert_ok('H1 the manager can read run history for the workspace',
   (select count(*) from public.workflow_runs where workflow_id = 'a3000000-0000-4000-8000-0000000000a1') >= 1);
+
+-- H2. The H3 exclusion in gtm_scope_rls.sql leaves these five tables out of the scope fingerprint. This
+-- check pins their own policies instead. The value below is production's fingerprint, read-only, before
+-- any Phase 5 migration. If a policy here changes, this fails, and the change needs its own review.
+select pg_temp.assert_ok('H2 the five workflow and notification tables keep production policies (fingerprint dbaa7dda)',
+  (select count(*) from pg_policies where schemaname = 'public'
+     and tablename in ('workflows', 'workflow_versions', 'workflow_runs', 'workflow_steps', 'notifications')) = 10
+  and (select md5(coalesce(string_agg(tablename || '|' || policyname || '|' || cmd || '|' || roles::text || '|' ||
+        coalesce(qual, '') || '|' || coalesce(with_check, ''), E'\n' order by tablename, policyname), ''))
+       from pg_policies where schemaname = 'public'
+         and tablename in ('workflows', 'workflow_versions', 'workflow_runs', 'workflow_steps', 'notifications'))
+      = 'dbaa7dda3908b3091076590c8d6d2b93');
 
 select pg_temp.act_as_postgres();

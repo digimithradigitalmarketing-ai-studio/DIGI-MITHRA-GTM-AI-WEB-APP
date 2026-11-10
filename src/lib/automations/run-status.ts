@@ -35,13 +35,13 @@ export function workflowStatusBadge(status: string): { tone: Tone; label: string
   return { tone: tones[status] ?? "neutral", label: titleCase(status) };
 }
 
-// A failed run can be retried once. The database refuses a second retry while a retry has
-// succeeded or is still in progress, and this mirrors that rule so the UI hides the button.
-const BLOCKING_RETRY_STATUSES = new Set(["running", "completed", "waiting_approval"]);
-
+// A failed run can be retried, but only once: the database allows at most one retry per run.
+// So any retry at all, whatever its status, hides the button on the original. The retry that
+// failed is the one to retry next (its own run has no retries yet). This mirrors
+// retry_workflow_run, so the UI never offers a button the database would refuse.
 export function canRetryRun(run: { status: string }, retries: { status: string }[]): boolean {
   if (run.status !== "failed") return false;
-  return !retries.some((r) => BLOCKING_RETRY_STATUSES.has(r.status));
+  return retries.length === 0;
 }
 
 // Pause and resume only apply to live workflows. A draft is activated instead.

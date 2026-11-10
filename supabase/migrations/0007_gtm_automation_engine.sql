@@ -7,8 +7,8 @@
 --   2. An idempotency key on tasks, with a partial unique index as the database safeguard.
 --   3. Retry linkage on workflow_runs (retry_of, attempt). A retry is a new run, so the history
 --      of the failed run is kept.
---   4. public.retry_workflow_run(run): retries only failed runs, and refuses a second retry once a
---      retry has succeeded or is still in progress.
+--   4. public.retry_workflow_run(run): retries only failed runs. A run has at most one retry, enforced
+--      by a row lock and a unique index on retry_of. Retry the latest failed attempt, not the original.
 --   5. A definition check on workflows. It rejects unknown node types and malformed nodes at write
 --      time. Before this, an unknown type only failed at run time.
 --
@@ -27,10 +27,11 @@
 revoke all on public.workflows, public.workflow_versions, public.workflow_runs,
               public.workflow_steps, public.notifications from anon;
 -- Functions carry a default EXECUTE grant to PUBLIC, so revoke from PUBLIC as well, then grant back.
+-- The grant list matches production's ACL: authenticated and service_role, never PUBLIC or anon.
 revoke all on function public.run_workflow_test(uuid, jsonb) from public, anon;
 revoke all on function public.cancel_workflow_run(uuid) from public, anon;
-grant execute on function public.run_workflow_test(uuid, jsonb) to authenticated;
-grant execute on function public.cancel_workflow_run(uuid) to authenticated;
+grant execute on function public.run_workflow_test(uuid, jsonb) to authenticated, service_role;
+grant execute on function public.cancel_workflow_run(uuid) to authenticated, service_role;
 
 -- ---------------------------------------------------------------------------
 -- 1. Idempotency key on tasks. Null for tasks created by people, so existing rows are unaffected.
@@ -48,13 +49,66 @@ alter table public.workflow_runs
   add column if not exists retry_of uuid references public.workflow_runs (id) on delete set null,
   add column if not exists attempt integer not null default 1;
 
-create index if not exists workflow_runs_retry_of_idx
+-- At most one retry per run. This is the database guarantee behind retry_workflow_run's row lock:
+-- even if a second retry got past the lock, its insert would fail here and roll back with it.
+drop index if exists public.workflow_runs_retry_of_idx;
+create unique index if not exists workflow_runs_one_retry_uniq
   on public.workflow_runs (retry_of)
   where retry_of is not null;
 
 -- ---------------------------------------------------------------------------
--- 3. Definition check. Runs before the version trigger on update.
+-- 3. Definition check. Structure and per-node config, so a bad definition fails at save time, not at run
+--    time. It mirrors src/lib/automations/definition.ts (validateDefinition). Keep the two in step.
+--    It runs only when the definition changes, so a status-only edit never re-validates old rows.
 -- ---------------------------------------------------------------------------
+create or replace function app_private.check_node_field(
+  p_pos integer, p_type text, p_cfg jsonb, p_key text, p_kind text, p_required boolean,
+  p_min integer, p_max integer, p_allowed text[] default null)
+returns void
+language plpgsql
+set search_path = ''
+as $$
+declare
+  v jsonb := p_cfg -> p_key;
+  s text;
+  num numeric;
+begin
+  if v is null or jsonb_typeof(v) = 'null' then
+    if p_required then
+      raise exception 'node % (%): config.% is required', p_pos, p_type, p_key using errcode = '22023';
+    end if;
+    return;
+  end if;
+
+  if p_kind = 'text' then
+    if jsonb_typeof(v) <> 'string' then
+      raise exception 'node % (%): config.% must be text', p_pos, p_type, p_key using errcode = '22023';
+    end if;
+    s := v #>> '{}';
+    if p_required and btrim(s) = '' then
+      raise exception 'node % (%): config.% cannot be empty', p_pos, p_type, p_key using errcode = '22023';
+    end if;
+    if char_length(s) > p_max then
+      raise exception 'node % (%): config.% is longer than % characters', p_pos, p_type, p_key, p_max
+        using errcode = '22023';
+    end if;
+    if p_allowed is not null and not (s = any (p_allowed)) then
+      raise exception 'node % (%): config.% must be one of: %', p_pos, p_type, p_key,
+        array_to_string(p_allowed, ', ') using errcode = '22023';
+    end if;
+  elsif p_kind = 'int' then
+    if jsonb_typeof(v) <> 'number' then
+      raise exception 'node % (%): config.% must be a whole number', p_pos, p_type, p_key using errcode = '22023';
+    end if;
+    num := (v #>> '{}')::numeric;
+    if num <> trunc(num) or num < p_min or num > p_max then
+      raise exception 'node % (%): config.% must be a whole number from % to %', p_pos, p_type, p_key,
+        p_min, p_max using errcode = '22023';
+    end if;
+  end if;
+end
+$$;
+
 create or replace function app_private.validate_workflow_definition()
 returns trigger
 language plpgsql
@@ -63,40 +117,76 @@ as $$
 declare
   node jsonb;
   ntype text;
+  cfg jsonb;
   n integer := 0;
   allowed constant text[] := array[
     'condition', 'create_lead', 'add_tag', 'set_priority', 'notify',
     'ai_draft', 'wait', 'approval', 'end', 'create_task'];
+  priorities constant text[] := array['low', 'normal', 'high', 'urgent'];
+  operators constant text[] := array['contains', 'equals', 'not_contains'];
 begin
-  if jsonb_typeof(new.definition->'nodes') is distinct from 'array' then
-    raise exception 'workflow definition must contain a nodes array' using errcode = '22023';
+  if jsonb_typeof(new.definition) is distinct from 'object'
+     or jsonb_typeof(new.definition -> 'nodes') is distinct from 'array' then
+    raise exception 'workflow definition must be an object with a nodes array' using errcode = '22023';
   end if;
-  for node in select * from jsonb_array_elements(new.definition->'nodes') loop
-    n := n + 1;
-    ntype := node->>'type';
-    if ntype is null or not (ntype = any (allowed)) then
-      raise exception 'unknown workflow node type: %', coalesce(ntype, '(none)') using errcode = '22023';
-    end if;
-  end loop;
-  if n > 25 then
+  if jsonb_array_length(new.definition -> 'nodes') > 25 then
     raise exception 'a workflow can have at most 25 nodes' using errcode = '22023';
   end if;
+
+  for node in select * from jsonb_array_elements(new.definition -> 'nodes') loop
+    n := n + 1;
+    if jsonb_typeof(node) is distinct from 'object' then
+      raise exception 'node % must be an object', n using errcode = '22023';
+    end if;
+    ntype := node ->> 'type';
+    if ntype is null or not (ntype = any (allowed)) then
+      raise exception 'unknown workflow node type: % (node %)', coalesce(ntype, '(none)'), n using errcode = '22023';
+    end if;
+
+    -- config is optional. When present it must be an object, and each key the engine reads is checked.
+    cfg := node -> 'config';
+    if cfg is null or jsonb_typeof(cfg) = 'null' then
+      cfg := '{}'::jsonb;
+    elsif jsonb_typeof(cfg) <> 'object' then
+      raise exception 'node % (%): config must be an object', n, ntype using errcode = '22023';
+    end if;
+
+    case ntype
+      when 'condition' then
+        perform app_private.check_node_field(n, ntype, cfg, 'field', 'text', false, 0, 40);
+        perform app_private.check_node_field(n, ntype, cfg, 'operator', 'text', false, 0, 20, operators);
+        perform app_private.check_node_field(n, ntype, cfg, 'value', 'text', false, 0, 200);
+      when 'create_lead' then
+        perform app_private.check_node_field(n, ntype, cfg, 'title', 'text', false, 0, 120);
+        perform app_private.check_node_field(n, ntype, cfg, 'value_inr', 'int', false, 0, 10000000);
+      when 'create_task' then
+        perform app_private.check_node_field(n, ntype, cfg, 'title', 'text', false, 0, 120);
+        perform app_private.check_node_field(n, ntype, cfg, 'description', 'text', false, 0, 500);
+        perform app_private.check_node_field(n, ntype, cfg, 'due_in_hours', 'int', false, 1, 720);
+        perform app_private.check_node_field(n, ntype, cfg, 'priority', 'text', false, 0, 20, priorities);
+      when 'add_tag' then
+        perform app_private.check_node_field(n, ntype, cfg, 'tag', 'text', true, 1, 40);
+      when 'set_priority' then
+        perform app_private.check_node_field(n, ntype, cfg, 'priority', 'text', false, 0, 20, priorities);
+      when 'notify' then
+        perform app_private.check_node_field(n, ntype, cfg, 'title', 'text', false, 0, 120);
+        perform app_private.check_node_field(n, ntype, cfg, 'body', 'text', false, 0, 500);
+      when 'ai_draft' then
+        perform app_private.check_node_field(n, ntype, cfg, 'template', 'text', false, 0, 500);
+      when 'wait' then
+        perform app_private.check_node_field(n, ntype, cfg, 'minutes', 'int', false, 0, 43200);
+      else
+        null;  -- approval and end take no config
+    end case;
+  end loop;
   return new;
 end
 $$;
 
-do $$
-begin
-  if not exists (
-    select 1 from pg_trigger
-     where tgname = 'trg_validate_definition'
-       and tgrelid = 'public.workflows'::regclass
-  ) then
-    create trigger trg_validate_definition
-      before insert or update on public.workflows
-      for each row execute function app_private.validate_workflow_definition();
-  end if;
-end $$;
+drop trigger if exists trg_validate_definition on public.workflows;
+create trigger trg_validate_definition
+  before insert or update of definition on public.workflows
+  for each row execute function app_private.validate_workflow_definition();
 
 -- ---------------------------------------------------------------------------
 -- 4. run_workflow with the create_task node. This is a full replacement of the 0007a version.
@@ -267,21 +357,25 @@ set search_path = ''
 as $$
 declare
   r public.workflow_runs;
+  v_child public.workflow_runs;
   v_new uuid;
 begin
-  select * into r from public.workflow_runs where id = p_run;
+  -- Two retries of the same run race here. The row lock makes the second wait until the first commits.
+  -- Once it has the lock, its statements see the first retry, so it is refused below. The unique index
+  -- on retry_of is the backstop if any other path tries to add a second child.
+  select * into r from public.workflow_runs where id = p_run for update;
   if not found then
     raise exception 'Run not found' using errcode = 'P0002';
   end if;
   perform app_private.require_ws_role(r.tenant_id, r.workspace_id, array['admin','manager']);
   if r.status <> 'failed' then
-    raise exception 'Only failed runs can be retried' using errcode = '22023';
+    raise exception 'Only failed runs can be retried; this run is %', r.status using errcode = '22023';
   end if;
-  if exists (
-    select 1 from public.workflow_runs x
-     where x.retry_of = r.id and x.status in ('running', 'completed', 'waiting_approval')
-  ) then
-    raise exception 'This run already has a successful or in-progress retry' using errcode = '22023';
+  -- A run that already has a retry is not retried again. Retry the latest failed attempt by its own id.
+  select * into v_child from public.workflow_runs where retry_of = r.id limit 1;
+  if found then
+    raise exception 'This run was already retried as run % (status %). Retry that run instead if it failed.',
+      v_child.id, v_child.status using errcode = '22023';
   end if;
 
   v_new := app_private.run_workflow(r.workflow_id, r.trigger_payload,
@@ -295,4 +389,4 @@ end
 $$;
 
 revoke all on function public.retry_workflow_run(uuid) from public, anon;
-grant execute on function public.retry_workflow_run(uuid) to authenticated;
+grant execute on function public.retry_workflow_run(uuid) to authenticated, service_role;

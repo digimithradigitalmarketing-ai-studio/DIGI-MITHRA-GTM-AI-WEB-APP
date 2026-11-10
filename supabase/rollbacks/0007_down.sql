@@ -155,12 +155,19 @@ drop trigger if exists trg_validate_definition on public.workflows;
 drop function if exists app_private.validate_workflow_definition();
 drop index if exists public.tasks_automation_key_uniq;
 alter table public.tasks drop column if exists automation_key;
+drop index if exists public.workflow_runs_one_retry_uniq;
 drop index if exists public.workflow_runs_retry_of_idx;
 alter table public.workflow_runs drop column if exists retry_of, drop column if exists attempt;
 
 -- ---------------------------------------------------------------------------
--- 4. Restore the privileges from before 0007 (Supabase default grants to anon and PUBLIC)
+-- 4. Restore the privileges that 0007 changed, to production's ACL (the pre-0007 state).
+--    Production has no PUBLIC or anon EXECUTE on the two run controls. It has anon on the
+--    workflow tables, because Supabase's default privileges granted it, and it has service_role.
+--    The grants below are the exact inverse of the revokes in 0007 section 0. Nothing is granted
+--    to PUBLIC, and the run controls are never granted to anon.
 -- ---------------------------------------------------------------------------
 grant all on public.workflows, public.workflow_versions, public.workflow_runs,
              public.workflow_steps, public.notifications to anon;
-grant execute on function public.run_workflow_test(uuid, jsonb), public.cancel_workflow_run(uuid) to public, anon;
+revoke all on function public.run_workflow_test(uuid, jsonb), public.cancel_workflow_run(uuid) from public, anon;
+grant execute on function public.run_workflow_test(uuid, jsonb), public.cancel_workflow_run(uuid) to authenticated, service_role;
+-- retry_workflow_run is new in 0007 and is dropped above. Nothing else in section 0 needs restoring.

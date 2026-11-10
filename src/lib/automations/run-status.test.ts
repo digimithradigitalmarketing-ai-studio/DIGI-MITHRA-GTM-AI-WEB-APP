@@ -6,13 +6,12 @@ describe("canRetryRun", () => {
     expect(canRetryRun({ status: "failed" }, [])).toBe(true);
   });
 
-  it("allows another retry when the earlier retry also failed", () => {
-    expect(canRetryRun({ status: "failed" }, [{ status: "failed" }])).toBe(true);
-  });
-
-  it.each(["completed", "running", "waiting_approval"])("blocks a retry while a retry is %s", (status) => {
-    expect(canRetryRun({ status: "failed" }, [{ status: "failed" }, { status }])).toBe(false);
-  });
+  it.each(["failed", "completed", "running", "waiting_approval"])(
+    "hides the button on the original once it has a retry that is %s (retry the retry instead)",
+    (status) => {
+      expect(canRetryRun({ status: "failed" }, [{ status }])).toBe(false);
+    },
+  );
 
   it.each(["completed", "running", "skipped", "cancelled", "waiting_approval"])("never retries a %s run", (status) => {
     expect(canRetryRun({ status }, [])).toBe(false);

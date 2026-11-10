@@ -5,6 +5,7 @@ import {
   isKnownNodeType,
   parseDefinition,
   parseDueInHours,
+  validateDefinition,
   validateFollowUpInput,
 } from "./definition";
 
@@ -191,5 +192,82 @@ describe("parseDefinition", () => {
     ]) {
       expect(isKnownNodeType(type)).toBe(true);
     }
+  });
+});
+
+describe("validateDefinition (mirrors the database check)", () => {
+  const node = (type: string, config?: unknown) => ({ type, ...(config === undefined ? {} : { config }) });
+  const defn = (...nodes: unknown[]) => ({ nodes });
+
+  it("accepts a valid follow-up definition and a boundary-valued one", () => {
+    expect(validateDefinition(defn(node("create_task", { title: "Call", due_in_hours: 720, priority: "urgent" }), node("end"))).ok).toBe(true);
+    expect(validateDefinition(defn(node("add_tag", { tag: "vip" }), node("end"))).ok).toBe(true);
+  });
+
+  it("accepts a node with no config, since config is optional", () => {
+    expect(validateDefinition(defn(node("end"), node("create_task")))).toMatchObject({ ok: true });
+  });
+
+  it("refuses a definition without a nodes array", () => {
+    expect(validateDefinition({})).toMatchObject({ ok: false });
+    expect(validateDefinition(null)).toMatchObject({ ok: false });
+    expect(validateDefinition([])).toMatchObject({ ok: false });
+  });
+
+  it("refuses an unknown node type and names the node", () => {
+    const result = validateDefinition(defn(node("send_email")));
+    expect(result).toEqual({ ok: false, error: "unknown workflow node type: send_email (node 1)" });
+  });
+
+  it("refuses a node that is not an object", () => {
+    expect(validateDefinition(defn("end"))).toEqual({ ok: false, error: "node 1 must be an object" });
+  });
+
+  it("refuses a config that is not an object", () => {
+    expect(validateDefinition(defn(node("create_task", "24h")))).toEqual({
+      ok: false,
+      error: "node 1 (create_task): config must be an object",
+    });
+  });
+
+  it("refuses a text due_in_hours, a fraction, zero and anything above 720", () => {
+    for (const due of ["soon", "24", 0, 721, 1.5]) {
+      expect(validateDefinition(defn(node("create_task", { due_in_hours: due })))).toMatchObject({ ok: false });
+    }
+  });
+
+  it("refuses an add_tag node without a tag, including a blank one", () => {
+    expect(validateDefinition(defn(node("add_tag", {})))).toEqual({
+      ok: false,
+      error: "node 1 (add_tag): config.tag is required",
+    });
+    expect(validateDefinition(defn(node("add_tag", { tag: "   " })))).toEqual({
+      ok: false,
+      error: "node 1 (add_tag): config.tag cannot be empty",
+    });
+  });
+
+  it("refuses an unknown priority and an unknown condition operator", () => {
+    expect(validateDefinition(defn(node("set_priority", { priority: "critical" })))).toMatchObject({ ok: false });
+    expect(validateDefinition(defn(node("condition", { operator: "starts_with", value: "x" })))).toMatchObject({ ok: false });
+  });
+
+  it("refuses text longer than its limit, counting characters", () => {
+    expect(validateDefinition(defn(node("create_task", { description: "x".repeat(501) })))).toMatchObject({ ok: false });
+    expect(validateDefinition(defn(node("create_task", { description: "x".repeat(500) })))).toMatchObject({ ok: true });
+    expect(validateDefinition(defn(node("create_task", { description: "é".repeat(500) })))).toMatchObject({ ok: true });
+  });
+
+  it("refuses more than 25 nodes", () => {
+    const many = Array.from({ length: 26 }, () => node("wait"));
+    expect(validateDefinition(defn(...many))).toEqual({ ok: false, error: "a workflow can have at most 25 nodes" });
+  });
+
+  it("names the node position when a later node is the bad one", () => {
+    const result = validateDefinition(defn(node("create_task", { due_in_hours: 24 }), node("wait", { minutes: -5 })));
+    expect(result).toEqual({
+      ok: false,
+      error: "node 2 (wait): config.minutes must be a whole number from 0 to 43200",
+    });
   });
 });

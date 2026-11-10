@@ -157,3 +157,98 @@ export function describeNode(node: WorkflowNode): string {
   if (node.type === "end") return "End";
   return node.type.replace(/_/g, " ");
 }
+
+// Mirrors app_private.validate_workflow_definition in migration 0007. Both must change together.
+// The database is the authority; this check lets the app explain a bad definition before a save.
+const CONDITION_OPERATORS = ["contains", "equals", "not_contains"] as const;
+const MAX_NODES = 25;
+
+type FieldRule =
+  | { key: string; kind: "text"; max: number; required?: boolean; allowed?: readonly string[] }
+  | { key: string; kind: "int"; min: number; max: number };
+
+const NODE_RULES: Record<NodeType, FieldRule[]> = {
+  condition: [
+    { key: "field", kind: "text", max: 40 },
+    { key: "operator", kind: "text", max: 20, allowed: CONDITION_OPERATORS },
+    { key: "value", kind: "text", max: 200 },
+  ],
+  create_lead: [
+    { key: "title", kind: "text", max: 120 },
+    { key: "value_inr", kind: "int", min: 0, max: 10_000_000 },
+  ],
+  create_task: [
+    { key: "title", kind: "text", max: 120 },
+    { key: "description", kind: "text", max: LIMITS.descriptionMax },
+    { key: "due_in_hours", kind: "int", min: LIMITS.dueInHoursMin, max: LIMITS.dueInHoursMax },
+    { key: "priority", kind: "text", max: 20, allowed: PRIORITIES },
+  ],
+  add_tag: [{ key: "tag", kind: "text", max: 40, required: true }],
+  set_priority: [{ key: "priority", kind: "text", max: 20, allowed: PRIORITIES }],
+  notify: [
+    { key: "title", kind: "text", max: 120 },
+    { key: "body", kind: "text", max: LIMITS.descriptionMax },
+  ],
+  ai_draft: [{ key: "template", kind: "text", max: LIMITS.descriptionMax }],
+  wait: [{ key: "minutes", kind: "int", min: 0, max: 43_200 }],
+  approval: [],
+  end: [],
+};
+
+export type DefinitionCheck = { ok: true; definition: WorkflowDefinition } | { ok: false; error: string };
+
+function checkField(position: number, type: NodeType, config: Record<string, unknown>, rule: FieldRule): string | null {
+  const where = `node ${position} (${type}): config.${rule.key}`;
+  const value = config[rule.key];
+  if (value === undefined || value === null) {
+    return rule.kind === "text" && rule.required ? `${where} is required` : null;
+  }
+  if (rule.kind === "text") {
+    if (typeof value !== "string") return `${where} must be text`;
+    const trimmed = value.trim();
+    if (rule.required && trimmed === "") return `${where} cannot be empty`;
+    // Code points, as Postgres char_length counts them.
+    if ([...value].length > rule.max) return `${where} is longer than ${rule.max} characters`;
+    if (rule.allowed && !(rule.allowed as readonly string[]).includes(value)) {
+      return `${where} must be one of: ${rule.allowed.join(", ")}`;
+    }
+    return null;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value < rule.min || value > rule.max) {
+    return `${where} must be a whole number from ${rule.min} to ${rule.max}`;
+  }
+  return null;
+}
+
+export function validateDefinition(raw: unknown): DefinitionCheck {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, error: "workflow definition must be an object with a nodes array" };
+  }
+  const nodes = (raw as { nodes?: unknown }).nodes;
+  if (!Array.isArray(nodes)) return { ok: false, error: "workflow definition must be an object with a nodes array" };
+  if (nodes.length > MAX_NODES) return { ok: false, error: `a workflow can have at most ${MAX_NODES} nodes` };
+
+  const checked: WorkflowNode[] = [];
+  for (let index = 0; index < nodes.length; index++) {
+    const position = index + 1;
+    const node = nodes[index];
+    if (!node || typeof node !== "object" || Array.isArray(node)) {
+      return { ok: false, error: `node ${position} must be an object` };
+    }
+    const type = (node as { type?: unknown }).type;
+    if (typeof type !== "string" || !isKnownNodeType(type)) {
+      return { ok: false, error: `unknown workflow node type: ${typeof type === "string" ? type : "(none)"} (node ${position})` };
+    }
+    const rawConfig = (node as { config?: unknown }).config;
+    if (rawConfig !== undefined && rawConfig !== null && (typeof rawConfig !== "object" || Array.isArray(rawConfig))) {
+      return { ok: false, error: `node ${position} (${type}): config must be an object` };
+    }
+    const config = (rawConfig ?? {}) as Record<string, unknown>;
+    for (const rule of NODE_RULES[type]) {
+      const problem = checkField(position, type, config, rule);
+      if (problem) return { ok: false, error: problem };
+    }
+    checked.push({ type, config: rawConfig ? config : undefined });
+  }
+  return { ok: true, definition: { nodes: checked } };
+}
