@@ -1,8 +1,11 @@
+import { Suspense } from "react";
 import { Sidebar } from "@/components/sidebar";
 import { Topbar } from "@/components/topbar";
 
 // Shell shared by every module screen. Route group (app) keeps URLs clean
 // (/dashboard, not /app/dashboard). Phase 2 adds the auth check here.
+// The sidebar reads the current path (usePathname), which is only known at request time, so it sits
+// inside Suspense. Without that, routes with dynamic segments fail to prerender.
 export default function AppShellLayout({
   children,
 }: {
@@ -16,7 +19,9 @@ export default function AppShellLayout({
       >
         Skip to content
       </a>
-      <Sidebar />
+      <Suspense fallback={<div className="hidden w-64 shrink-0 lg:block" aria-hidden="true" />}>
+        <Sidebar />
+      </Suspense>
       <div className="flex min-w-0 flex-1 flex-col">
         <Topbar />
         <main id="main" className="flex-1 px-4 py-6 sm:px-6 lg:px-8">
