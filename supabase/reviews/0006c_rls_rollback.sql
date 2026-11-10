@@ -1,0 +1,43 @@
+-- 0006c_rls_rollback.sql
+-- REVIEW ONLY. NOT A MIGRATION. NOT APPLIED TO ANY DATABASE.
+-- Reverses supabase/reviews/0006c_rls_review.sql.
+--
+-- Before running the review file, record the privileges it changes, because the
+-- correct rollback depends on the state before it ran:
+--
+--   select grantee, table_name, privilege_type
+--     from information_schema.role_table_grants
+--    where table_schema = 'public'
+--      and table_name in ('clients', 'deals', 'webhook_events')
+--    order by 1, 2, 3;
+--
+--   select tablename, policyname from pg_policies
+--    where schemaname = 'public' and tablename in ('clients', 'deals', 'webhook_events');
+--
+-- Paste both results into the change record. Policies are dropped here only when
+-- they were absent before the review file ran. If 0006b was applied first, its
+-- policies were already there, so do not drop them in this rollback.
+--
+-- Idempotent.
+
+-- 1. Policies created by 0006c, only if the change record shows they were absent before.
+--    Uncomment only after checking the change record.
+-- drop policy if exists clients_read on public.clients;
+-- drop policy if exists clients_insert on public.clients;
+-- drop policy if exists clients_update on public.clients;
+-- drop policy if exists clients_delete on public.clients;
+-- drop policy if exists deals_read on public.deals;
+-- drop policy if exists deals_insert on public.deals;
+-- drop policy if exists deals_update on public.deals;
+-- drop policy if exists deals_delete on public.deals;
+
+-- 2. webhook_events grants. Restore the privileges recorded before the review ran.
+--    Restore client grants only when a verified consumer needs them. Otherwise leave
+--    them revoked. Do not restore them to fix an unknown consumer without a review.
+--    Example, only if the change record shows the grants existed before:
+-- grant select, insert, update, delete on public.webhook_events to authenticated;
+
+-- 3. RLS stays enabled on all three tables. Do not disable RLS in a rollback.
+-- alter table public.clients enable row level security;   -- no-op if already on
+-- alter table public.deals enable row level security;
+-- alter table public.webhook_events enable row level security;

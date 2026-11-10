@@ -116,6 +116,11 @@ sed -n '/^CREATE OR REPLACE FUNCTION app_private.run_workflow(/,/^end \$function
   | sed 's/app_private\.run_workflow(/app_private.run_workflow_legacy(/' > "$LEGACY_PRELUDE"
 grep -q "run_workflow_legacy(p_workflow" "$LEGACY_PRELUDE" || { echo "could not extract the 0007a engine" >&2; exit 1; }
 
+# 0006c review: the webhook fixture plus the review file run first, inside the same
+# rolled-back transaction, before the checks in 50_review_0006c_tests.sql.
+REVIEW_PRELUDE="$RESULTS/review_0006c_prelude.sql"
+cat "$HERE/50a_webhook_fixture.sql" "$SUPA/reviews/0006c_rls_review.sql" > "$REVIEW_PRELUDE"
+
 # Final suites after 0004b, on both paths. The fixtures are rolled back, so the replicas stay clean.
 for db_md5 in "gtm_local_live_replay $MD5_A" "gtm_local_fresh $MD5_B"; do
   set -- $db_md5
@@ -123,6 +128,7 @@ for db_md5 in "gtm_local_live_replay $MD5_A" "gtm_local_fresh $MD5_B"; do
   run_suite "$1" "$HERE/30_gtm_completion_tests.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/40_automation_engine_tests.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/41_legacy_node_regression.sql" "$2" final "$LEGACY_PRELUDE" || FAIL=1
+  run_suite "$1" "$HERE/50_review_0006c_tests.sql" "$2" final "$REVIEW_PRELUDE" || FAIL=1
 done
 
 # Path C: rollback round trip. 0007 is applied and then rolled back on a scratch replica. The privilege
