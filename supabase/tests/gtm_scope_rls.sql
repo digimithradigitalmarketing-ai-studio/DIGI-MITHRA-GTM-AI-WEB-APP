@@ -549,14 +549,18 @@ do $$ begin
   end if;
 end $$;
 
--- H3: existing RLS policies are byte-identical to the baseline taken before migration
+-- H3: existing RLS policies are byte-identical to the baseline taken before migration.
+-- The workflow engine and notification tables are excluded: 0007a records their live policies
+-- for the first time, so they are not part of the pre-GTM baseline. Their own suite is 40_*.
 do $$ declare v text; begin
   select md5(coalesce(string_agg(
     tablename || '|' || policyname || '|' || cmd || '|' || roles::text || '|' ||
     coalesce(qual, '') || '|' || coalesce(with_check, ''), E'\n' order by tablename, policyname), ''))
     into v
     from pg_policies
-   where schemaname = 'public' and tablename not in ('companies', 'clients', 'deals');
+   where schemaname = 'public'
+     and tablename not in ('companies', 'clients', 'deals',
+                           'workflows', 'workflow_versions', 'workflow_runs', 'workflow_steps', 'notifications');
   if v <> current_setting('gtm.baseline_policy_md5') then
     raise exception 'FAIL H3: existing RLS policies changed';
   end if;
