@@ -2,7 +2,7 @@
 
 Web app for running a gym's leads, members, deals, campaigns and automations. Built with Next.js (App Router), Tailwind CSS and TypeScript.
 
-This build is **Phase 1 of the AI GTM Command Center build guide**: the responsive app shell with synthetic demo data. It has no database and no sign-in yet. Those arrive in Phase 2 (Supabase Auth and Postgres with row-level security).
+This build is **Phase 1 of the AI GTM Command Center build guide**: the responsive app shell with synthetic demo data. It has no database and no sign-in yet. Those arrive in Phase 2 (Supabase Auth and Postgres).
 
 ## Run it
 
@@ -18,6 +18,17 @@ npm run lint       # ESLint, must exit 0
 npm run build      # production build, must exit 0
 npm start          # serve the production build
 ```
+
+## Deploy to Vercel
+
+This is a Next.js app, so Vercel can build it with its built-in Next.js support; no custom output directory or `vercel.json` is needed.
+
+1. Import `digimithradigitalmarketing-ai-studio/DIGI-MITHRA-GTM-AI-WEB-APP` in [Vercel](https://vercel.com/new).
+2. Keep the framework preset as **Next.js**, the root directory as `./`, and the default build settings. The build command is `npm run build`.
+3. For this Phase 1 demo, the app uses synthetic data and does not require environment variables to build. If you enable the integrations in a later phase, add their values in **Project Settings → Environment Variables** for each environment where they are needed. Use `.env.example` as the variable-name reference; never commit secrets or expose server-only keys with a `NEXT_PUBLIC_` prefix.
+4. Click **Deploy**. Vercel will build and publish the app; subsequent pushes to the connected repository are deployed automatically.
+
+You can verify a deployment locally first with `npm run lint`, `npm test`, and `npm run build`.
 
 ## Screens
 
