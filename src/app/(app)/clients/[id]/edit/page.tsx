@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { Suspense } from "react";
+import { ClientsModuleNotice } from "@/components/crm/clients-module-notice";
 import { ListSkeleton } from "@/components/crm/list-skeleton";
 import { QueryNotice } from "@/components/crm/query-notice";
 import { RecordForm } from "@/components/crm/record-form";
@@ -9,6 +10,7 @@ import { loadWorkspaceAccess } from "@/lib/automations/context";
 import { isUuid } from "@/lib/automations/ids";
 import { clientDefaults, clientFields } from "@/lib/crm/form-fields";
 import { companyOptions, contactOptions, getClient } from "@/lib/crm/queries";
+import { loadClientsReadiness } from "@/lib/crm/readiness";
 import { can, effectiveRole } from "@/lib/crm/roles";
 import { settle } from "@/lib/crm/settle";
 import { crmHref } from "@/lib/crm/url";
@@ -29,6 +31,15 @@ export default function EditClientPage({ params }: { params: Params }) {
 async function EditClientForm({ params }: { params: Params }) {
   const { id } = await params;
   if (!isUuid(id)) notFound();
+  const readiness = await loadClientsReadiness();
+  if (readiness.state !== "ready") {
+    return (
+      <>
+        <PageHeader title="Edit client" />
+        <ClientsModuleNotice state={readiness.state} />
+      </>
+    );
+  }
   const client = await settle(() => getClient(id));
   if (client.error) return <QueryNotice error={client.error} />;
   const row = client.value;

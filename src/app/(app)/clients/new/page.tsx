@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Suspense } from "react";
+import { ClientsModuleNotice } from "@/components/crm/clients-module-notice";
 import { ListSkeleton } from "@/components/crm/list-skeleton";
 import { QueryNotice } from "@/components/crm/query-notice";
 import { RecordForm } from "@/components/crm/record-form";
@@ -8,6 +9,7 @@ import { loadAutomationContext } from "@/lib/automations/context";
 import { isUuid } from "@/lib/automations/ids";
 import { clientDefaults, clientFields } from "@/lib/crm/form-fields";
 import { companyOptions, contactOptions } from "@/lib/crm/queries";
+import { loadClientsReadiness } from "@/lib/crm/readiness";
 import { can, effectiveRole } from "@/lib/crm/roles";
 import { settle } from "@/lib/crm/settle";
 import { crmHref } from "@/lib/crm/url";
@@ -27,6 +29,15 @@ export default function NewClientPage({ searchParams }: { searchParams: SearchPa
 
 async function NewClientForm({ searchParams }: { searchParams: SearchParams }) {
   const sp = await searchParams;
+  const readiness = await loadClientsReadiness();
+  if (readiness.state !== "ready") {
+    return (
+      <>
+        <PageHeader title="New client" />
+        <ClientsModuleNotice state={readiness.state} />
+      </>
+    );
+  }
   const { current } = await loadAutomationContext(sp.workspace);
   if (!current) return <Notice tone="warning">Your account is not a member of a workspace.</Notice>;
 

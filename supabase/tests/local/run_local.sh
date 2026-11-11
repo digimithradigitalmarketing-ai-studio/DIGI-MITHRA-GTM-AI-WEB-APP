@@ -93,6 +93,7 @@ run gtm_local_live_replay "$SUPA/migrations/0004b_gtm_archive_columns.sql"
 # Phase 5. 0007a records the live workflow engine (a no-op on production), then 0007 extends it.
 run gtm_local_live_replay "$SUPA/migrations/0007a_gtm_workflow_baseline.sql"
 run gtm_local_live_replay "$SUPA/migrations/0007_gtm_automation_engine.sql"
+run gtm_local_live_replay "$SUPA/migrations/0008_gtm_clients_readiness.sql"
 
 # Path B: a clean database with the same migration files, no partial state and no drift.
 # 0004b is a no-op here, which checks that it is idempotent.
@@ -105,6 +106,7 @@ done
 run gtm_local_fresh "$SUPA/migrations/0004b_gtm_archive_columns.sql"   # second apply: must be a no-op
 run gtm_local_fresh "$SUPA/migrations/0007a_gtm_workflow_baseline.sql"
 run gtm_local_fresh "$SUPA/migrations/0007_gtm_automation_engine.sql"
+run gtm_local_fresh "$SUPA/migrations/0008_gtm_clients_readiness.sql"
 
 echo "replay complete: gtm_local_live_replay, gtm_local_fresh"
 
@@ -127,6 +129,7 @@ for db_md5 in "gtm_local_live_replay $MD5_A" "gtm_local_fresh $MD5_B"; do
   run_suite "$1" "$SUPA/tests/gtm_scope_rls.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/30_gtm_completion_tests.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/31_crm_role_matrix_tests.sql" "$2" final || FAIL=1
+  run_suite "$1" "$HERE/32_clients_readiness_tests.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/40_automation_engine_tests.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/41_legacy_node_regression.sql" "$2" final "$LEGACY_PRELUDE" || FAIL=1
   run_suite "$1" "$HERE/50_review_0006c_tests.sql" "$2" final "$REVIEW_PRELUDE" || FAIL=1

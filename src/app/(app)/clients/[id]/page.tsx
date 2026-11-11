@@ -6,11 +6,13 @@ import { CrmActionButton } from "@/components/crm/action-button";
 import { DetailList } from "@/components/crm/detail";
 import { ListSkeleton } from "@/components/crm/list-skeleton";
 import { QueryNotice } from "@/components/crm/query-notice";
+import { ClientsModuleNotice } from "@/components/crm/clients-module-notice";
 import { Badge, Notice, PageHeader, Panel } from "@/components/ui";
 import { loadWorkspaceAccess } from "@/lib/automations/context";
 import { isUuid } from "@/lib/automations/ids";
 import { archivedBadge, clientStatusBadge } from "@/lib/crm/badges";
 import { getClient, namesById } from "@/lib/crm/queries";
+import { loadClientsReadiness } from "@/lib/crm/readiness";
 import { can, effectiveRole } from "@/lib/crm/roles";
 import { settle } from "@/lib/crm/settle";
 import { crmHref } from "@/lib/crm/url";
@@ -32,6 +34,15 @@ export default function ClientDetailPage({ params }: { params: Params }) {
 async function ClientDetail({ params }: { params: Params }) {
   const { id } = await params;
   if (!isUuid(id)) notFound();
+  const readiness = await loadClientsReadiness();
+  if (readiness.state !== "ready") {
+    return (
+      <>
+        <PageHeader title="Client" />
+        <ClientsModuleNotice state={readiness.state} />
+      </>
+    );
+  }
   const client = await settle(() => getClient(id));
   if (client.error) {
     return (
