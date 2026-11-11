@@ -134,6 +134,7 @@ for db_md5 in "gtm_local_live_replay $MD5_A" "gtm_local_fresh $MD5_B"; do
   run_suite "$1" "$HERE/40_automation_engine_tests.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/41_legacy_node_regression.sql" "$2" final "$LEGACY_PRELUDE" || FAIL=1
   run_suite "$1" "$HERE/50_review_0006c_tests.sql" "$2" final "$REVIEW_PRELUDE" || FAIL=1
+  run_suite "$1" "$HERE/39_f2_clients_deals_matrix.sql" "$2" final || FAIL=1
 done
 
 # Path C: rollback round trip. 0007 is applied and then rolled back on a scratch replica. The privilege
@@ -238,6 +239,7 @@ run_suite gtm_local_prod_surface "$HERE/35_anon_rollback_tests.sql" "$MD5_E" res
 run_suite gtm_local_prod_surface "$HERE/40_automation_engine_tests.sql" "$MD5_E" final || FAIL=1
 run_suite gtm_local_prod_surface "$HERE/41_legacy_node_regression.sql" "$MD5_E" final "$LEGACY_PRELUDE" || FAIL=1
 run_suite gtm_local_prod_surface "$HERE/50_review_0006c_tests.sql" "$MD5_E" final "$REVIEW_PRELUDE" || FAIL=1
+run_suite gtm_local_prod_surface "$HERE/39_f2_clients_deals_matrix.sql" "$MD5_E" final || FAIL=1
 
 # Refusal: the rollback must refuse TRUNCATE. A pass here would mean the allow-list is not enforced.
 if { echo "begin;"; cat "$PRELUDE_TRUNCATE"; echo "rollback;"; } | "${PSQL[@]}" -d gtm_local_prod_surface -f - >"$RESULTS/gtm_local_prod_surface.0009_truncate_refused.log" 2>&1; then
@@ -256,6 +258,7 @@ echo "surface path complete: advisor output in $RESULTS/gtm_local_prod_surface.a
 
 # Path D: two real sessions race a retry on a committed database (not rolled back).
 PGHOST="$PGHOST" PGPORT="$PGPORT" "$HERE/concurrency_retry.sh" || FAIL=1
+PGHOST="$PGHOST" PGPORT="$PGPORT" "$HERE/concurrency_task_dedupe.sh" || FAIL=1
 
 # Path F: 0006b round trip, in production order. 0004b must come first: the archive guard in 0006b reads archived_at,
 # and production has no archived_* columns yet. The snapshot S0 is taken before 0006b, S1 after it, S2 after
@@ -278,9 +281,12 @@ snap S1
 run_suite gtm_local_0006b "$SUPA/tests/gtm_scope_rls.sql" "$MD5_F" 0006b-applied || FAIL=1
 run_suite gtm_local_0006b "$HERE/30_gtm_completion_tests.sql" "$MD5_F" 0006b-applied || FAIL=1
 run_suite gtm_local_0006b "$HERE/31_crm_role_matrix_tests.sql" "$MD5_F" 0006b-applied || FAIL=1
+run_suite gtm_local_0006b "$HERE/39_f2_clients_deals_matrix.sql" "$MD5_F" 0006b-applied || FAIL=1
 # 32 needs 0008 (not applied on path F); it runs on paths B and E.
 run gtm_local_0006b "$SUPA/rollbacks/0006b_down.sql" || { echo "FAILED: path F 0006b_down" >&2; exit 1; }
 snap S2
+# Fail-closed after the rollback (39b): clients and deals read zero rows for every app role; the observed archive limit is asserted.
+run_suite gtm_local_0006b "$HERE/39b_0006b_rollback_fail_closed.sql" "$MD5_F" 0006b-rolled-back || FAIL=1
 # Assert the privileges that 0006b_down deliberately leaves revoked (anon: none; authenticated: no TRUNCATE,
 # REFERENCES, TRIGGER or MAINTAIN), and the rest of the state that must return to the baseline.
 "${PSQL[@]}" -d gtm_local_0006b -f "$HERE/37_0006b_rollback_asserts.sql" > "$RESULTS/0006b.asserts.log" 2>&1 \
@@ -307,6 +313,7 @@ fi
 run_suite gtm_local_0006b "$SUPA/tests/gtm_scope_rls.sql" "$MD5_F" 0006b-reapplied || FAIL=1
 run_suite gtm_local_0006b "$HERE/30_gtm_completion_tests.sql" "$MD5_F" 0006b-reapplied || FAIL=1
 run_suite gtm_local_0006b "$HERE/31_crm_role_matrix_tests.sql" "$MD5_F" 0006b-reapplied || FAIL=1
+run_suite gtm_local_0006b "$HERE/39_f2_clients_deals_matrix.sql" "$MD5_F" 0006b-reapplied || FAIL=1
 
 # Path G: 0010 least-privilege round trip and test 36, on a copy of the production-shaped surface. The copy is
 # taken from path E's final state, which is rolled back, so it has no 0009 or 0010 objects.

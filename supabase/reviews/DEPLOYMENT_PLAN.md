@@ -54,22 +54,27 @@ before steps 7 and 8 would break those features.
 ## 3. Migration dependency order
 
 ```
-C0  catalog check (read only)
-4   0004b_gtm_archive_columns            needs 0004 objects
+C0  catalog check (read only) and reviews/0007_0008_0006b_dependency_verify.sql (read only)
+4   0004b_gtm_archive_columns            needs 0004 objects. Must precede 5 on the drifted production shape (R4)
 5   0006b_gtm_rls_completion             needs 4 (archive guard reads archived_at) and the four companies_* policies
-6   0007a_gtm_workflow_baseline          parity baseline
-7   0007_gtm_automation_engine           needs 6
-8   0008_gtm_clients_readiness           needs clients (5)
-9   0009_anon_hardening                  last of the schema changes; needs 4-8 verified (steps are independent of 9's
-                                         baseline, but 9 must come after the verify queries pass)
+6   0007a_gtm_workflow_baseline          parity baseline; needed by 7 (workflows tables)
+7   0007_gtm_automation_engine           needs 6. Does not touch companies, clients or deals, so independent of 4 and 5
+8   0008_gtm_clients_readiness           needs only clients and ws_role. Independent of 4-7. Until 5 creates the clients
+                                         policies, readiness returns not_configured: expected, not an error
+9   0009_anon_hardening                  after 4-8 verified; the privilege change is independent of 4-8's objects
 10  0010_gtm_least_privilege             after 9 (9 removes anon's privileges; 10 removes authenticated's TRUNCATE)
 ```
+
+Dependencies proved on the replica (2026-11-11): 0007 fails without 0007a (`workflows` missing); 0008 applies without 0004b,
+0006b, 0007a or 0007; 0007a and 0007 apply without 0004b or 0006b. The only ordering constraint that fails at write time is
+4 before 5 on the drifted production shape (R4).
 
 Verify-only, never run: `0002`, `0003`, `0004`, `0005` (use `0005_verify_only.sql`), `0005a`, `0006` (partial).
 Review-only, not migrations: `0006c_rls_review.sql`, `0009_anon_hardening_notes.md`.
 
-Note on order: `0006b` must run after `0004b`. The harness path A runs them the other way to reproduce the
-failure; that order is not a deployment order.
+Note on order: `0006b` must run after `0004b` on the drifted production shape. The harness path A runs them the other way to
+reproduce the failure; that order is not a deployment order. The probe `reviews/0007_0008_0006b_dependency_verify.sql`
+checks the presence of every object these steps need, and is read-only.
 
 ## 4. Verify-only migrations and production schema checks
 
@@ -96,9 +101,21 @@ select to_regprocedure('public.retry_workflow_run(uuid)') is not null;     -- ex
 Then run `tests/local/fingerprint_surface.sql` and `tests/local/columns_surface.sql` and compare with
 `production_digests.expected`. Any difference stops the plan.
 
+**Dependency probe (read-only, C0 and after each step).** Run `reviews/0007_0008_0006b_dependency_verify.sql` on production.
+It runs in one `begin read only` transaction and returns one row per check (81 checks). Expected today: the missing set
+in section 2 (archive columns, `guard_archive`, `sync_deal_status`, `clients_read`, `deals_read`, `trg_deal_status`,
+`retry_workflow_run`, `clients_readiness`, `validate_workflow_definition`, `tasks.automation_key`,
+`workflow_runs.retry_of`, `workflow_runs.attempt`, and the two unique indexes). After each step, the missing set may
+shrink only by that step's objects. Any other change stops the plan. The probe's `conversations` and `messages` items are
+expected to be present on production (R3).
+
 ## 5. Ordered steps
 
 Each step runs in one transaction (`psql -1`, or the runner's transaction). Stop at the first unexpected result.
+
+**Approval.** Each step 4 to 10 needs its own written owner approval, naming the file and its SHA-256 (section 15). No step
+is batched under another step's approval. The hashes are those of the files at this commit; if a file changes, its
+approval is void.
 
 **Step 4, 0004b_gtm_archive_columns.sql.** Adds `archived_at` and `archived_by` and the active-row indexes.
 Idempotent (replica path B runs it twice). Rollback: `rollbacks/0004b_down.sql`, which must run after 0006b is rolled back.
@@ -108,15 +125,17 @@ Verify: the archive-drift query returns six rows.
 SELECT, INSERT, UPDATE and DELETE to authenticated. Adds the clients and deals policies, `guard_archive`,
 `sync_deal_status` and their triggers. Rollback: `rollbacks/0006b_down.sql`, tested in path F (section 8).
 Known limit: the rollback does not restore grants, by design (section 7). Verify: `clients` and `deals` each have policies.
+Open limitations R1 (an editor can edit archived rows) and R2 (the rollback removes the company archive guard) are in the
+security report, section 2a. Owner decision needed before step 5.
 
 **Step 6, 0007a_gtm_workflow_baseline.sql.** Parity baseline. Verify the `run_workflow` body md5 is unchanged.
 No rollback file. Recovery is a restore from backup.
 
-**Step 7, 0007_gtm_automation_engine.sql.** Revokes ALL on workflow tables from anon; revokes EXECUTE on
+**Step 7, 0007_gtm_automation_engine.sql.** Requires step 6 (`workflows` must exist). Revokes ALL on workflow tables from anon; revokes EXECUTE on
 `run_workflow_test`, `cancel_workflow_run`, `retry_workflow_run` from PUBLIC and anon. Rollback:
 `rollbacks/0007_down.sql`, round-trip tested in path C.
 
-**Step 8, 0008_gtm_clients_readiness.sql.** Creates `clients_readiness()`, SECURITY INVOKER, `search_path ''`. Revokes
+**Step 8, 0008_gtm_clients_readiness.sql.** Needs only `clients` and `ws_role`; independent of steps 4 to 7. Creates `clients_readiness()`, SECURITY INVOKER, `search_path ''`. Revokes
 PUBLIC and anon. Rollback: `rollbacks/0008_down.sql`; the app then shows "Clients module not configured". Verify:
 `has_function_privilege('anon', 'public.clients_readiness()', 'EXECUTE')` is false.
 
@@ -152,7 +171,8 @@ default ACL for TRUNCATE. Rollback: `reviews/0010_gtm_least_privilege_rollback.s
 | Rollback | Limitation |
 | --- | --- |
 | 0004b_down | Drops archive columns. Must not run while 0006b's guard is active |
-| 0006b_down | Does not restore grants: anon stays at none, and authenticated stays at DML only (no TRUNCATE, REFERENCES, TRIGGER, MAINTAIN). This is the intended result (path F asserts it). It is not a full restoration |
+| 0006b_down | Does not restore grants: anon stays at none, and authenticated stays at DML only (no TRUNCATE, REFERENCES, TRIGGER, MAINTAIN). This is the intended result (path F asserts it). It is not a full restoration. It also removes the companies archive guard and audit trigger, and leaves clients and deals fail closed (security report R2) |
+| 0007a | No rollback file. Recovery is a restore from backup (B1) |
 | 0007_down | Round-trip tested |
 | 0008_down | The Clients module shows "not configured" |
 | 0009 rollback | Selective only. Refuses TRUNCATE, REFERENCES, TRIGGER, MAINTAIN. Never restores default ACLs or `rls_auto_enable` |
@@ -173,6 +193,11 @@ default ACL for TRUNCATE. Rollback: `reviews/0010_gtm_least_privilege_rollback.s
 
 Suite 30 is run only in path F: it asserts the 0006b grant state and is not part of the 0010 path.
 Suite 32 needs 0008, so it runs in paths B and E, not F.
+
+Added on 2026-11-11: suite 39 (F2 clients and deals role matrix) runs in path A (final), B (final), E (final), and path F
+(applied and reapplied). Suite 39b (fail-closed behaviour after `0006b_down`) runs in path F. The two-session dedupe race
+(`concurrency_task_dedupe.sh`) runs in path D. Result: harness exit 0, 56 passing lines, 5 expected-failure controls.
+Dedupe race: session B waited 1.99 s on session A's lock; one run and one task.
 
 ## 9. Post-migration RLS verification (read-only)
 
@@ -207,8 +232,9 @@ where 0006b, 0007, 0008, 0009 and 0010 changed them.
 
 ## 10. Backup and recovery verification
 
-- **Not verified (P2).** The tools available here cannot read backup status or run a restore. Owner action: confirm a
-  backup taken inside the window, and run a restore to a scratch project before step 4.
+- **BLOCKED (B1, P2). Every step is blocked until this is confirmed independently.** The tools available here cannot read
+  backup status or run a restore. Owner action: confirm a backup taken inside the window, and run a restore to a scratch
+  project before step 4. Record the backup ID, time and restore result.
 - Recovery order: first the step's rollback file (section 5), then restore from the verified backup (P2). Do not
   improvise a data repair.
 - A write failing with `record "new" has no field "archived_at"` means step 4 was skipped. Run step 4, then continue.
@@ -229,6 +255,10 @@ Recovery actions by failure: section 7 for the rollback, section 10 for restore.
 ## 12. Advisor baseline comparison
 
 Baseline 2026-11-11 (read-only): security 45, performance 108, health 0. Detail in `docs/advisor-baseline.md`.
+
+The real Supabase advisor was not run before or after any change, because no isolated project was approved (security
+report R6). The only pre and post figures are from the local emulated advisor (`reviews/0009_emulated_advisor.sql`):
+anon-executable security-definer functions 9 to 8, and anon table write-or-truncate grants 18 to 0.
 
 Expected changes, to be verified after each step (predictions, not observations):
 
@@ -253,6 +283,8 @@ Any other difference must be explained before the window closes.
 7. Production migration history does not record the GTM migrations (reconciliation report). Recording them is an owner decision
    after a verified backup.
 8. Replica is production-shaped, not production: the 56-table scope is modelled with empty placeholder tables, and no data is copied.
+9. F3, F4, F5 and F6 are outstanding (security report section 2). The owner has not risk-accepted them.
+10. Owner decisions R1 to R6 (security report section 2a) are open. R5 and R6 are limits of this round's testing.
 
 ## 14. Leaked-password protection (research)
 
@@ -267,3 +299,19 @@ Any other difference must be explained before the window closes.
 
 Not requested. Request it only after blockers 1, 2, 3 and 4 are closed or explicitly accepted by the owner. The request
 must list each step, its file SHA-256, the C0 output, the verification queries, and each rollback.
+
+Steps awaiting separate owner approval (SHA-256 of the files at this commit, computed 2026-11-11):
+
+| Order | Step | File | SHA-256 |
+| --- | --- | --- | --- |
+| 4 | 0004b_gtm_archive_columns | `supabase/migrations/0004b_gtm_archive_columns.sql` | `af864ae6153cde6356c5fff6f767c4a74f58a9a992b0d1271fab6a8d032f98f6` |
+| 5 | 0006b_gtm_rls_completion | `supabase/migrations/0006b_gtm_rls_completion.sql` | `be2ef8a21f3c15a6d045d8b876e968884cba36cf8208fa766480f3fffedbf3b4` |
+| 6 | 0007a_gtm_workflow_baseline | `supabase/migrations/0007a_gtm_workflow_baseline.sql` | `d9214fc3d2868cdf0cb0705deb2384e317bdff322acf3334d48ca58100531cac` |
+| 7 | 0007_gtm_automation_engine | `supabase/migrations/0007_gtm_automation_engine.sql` | `f68563edb1a8e5abcb7b8abe79ab78500c905d7ec4a862bc74f11907161f6682` |
+| 8 | 0008_gtm_clients_readiness | `supabase/migrations/0008_gtm_clients_readiness.sql` | `94fd8fd802468fe7a6494bb6790c7ef747ac94971c5177e36eeee6dc4f8d7249` |
+| 9 | 0009_anon_hardening (proposed) | `supabase/reviews/0009_anon_hardening_proposed.sql` | `13762ae13ad47be9bdb93f2f59831e773a176e187a4a0dcb56083a9184077d18` |
+| 10 | 0010_gtm_least_privilege (proposed) | `supabase/reviews/0010_gtm_least_privilege_proposed.sql` | `af111c235e7d2a9f7f1c0bbad83e4033eef7d66117e205bb3a05cdf94cf8cd75` |
+| C0 | Dependency probe (read-only; no approval needed to run) | `supabase/reviews/0007_0008_0006b_dependency_verify.sql` | `dfc8ab0c2602bf201e300b3899476d8a9f9a13a61834368f2aa791c77c36b55b` |
+
+Each approval covers only the named file and hash. If a hash differs at execution, stop and re-approve. Verify-only
+items (0002, 0003, 0004, 0005 via `0005_verify_only.sql`) and 0005a (not reviewed) are not in this table.
