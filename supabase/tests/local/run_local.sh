@@ -126,6 +126,7 @@ for db_md5 in "gtm_local_live_replay $MD5_A" "gtm_local_fresh $MD5_B"; do
   set -- $db_md5
   run_suite "$1" "$SUPA/tests/gtm_scope_rls.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/30_gtm_completion_tests.sql" "$2" final || FAIL=1
+  run_suite "$1" "$HERE/31_crm_role_matrix_tests.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/40_automation_engine_tests.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/41_legacy_node_regression.sql" "$2" final "$LEGACY_PRELUDE" || FAIL=1
   run_suite "$1" "$HERE/50_review_0006c_tests.sql" "$2" final "$REVIEW_PRELUDE" || FAIL=1

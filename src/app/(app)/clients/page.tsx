@@ -1,57 +1,129 @@
 import type { Metadata } from "next";
+import Link from "next/link";
+import { Suspense } from "react";
+import { ListControls } from "@/components/crm/list-controls";
+import { ListSkeleton } from "@/components/crm/list-skeleton";
+import { QueryNotice } from "@/components/crm/query-notice";
+import { WorkspaceSwitcher } from "@/components/crm/workspace-switcher";
 import { Badge, DataTable, EmptyState, PageHeader, Panel } from "@/components/ui";
-import { clients } from "@/lib/data";
-import { formatDate, formatINR } from "@/lib/format";
-import { clientStatusBadge } from "@/lib/status";
+import { loadAutomationContext } from "@/lib/automations/context";
+import { clientStatusBadge } from "@/lib/crm/badges";
+import { listClients, namesById } from "@/lib/crm/queries";
+import { can, effectiveRole } from "@/lib/crm/roles";
+import { settle } from "@/lib/crm/settle";
+import { CLIENT_STATUSES } from "@/lib/crm/validation";
+import { pageCount, parseArchived, parsePage, pickOptional, sanitizeSearch } from "@/lib/crm/search";
+import { crmHref } from "@/lib/crm/url";
+import { formatDate, formatINR, titleCase } from "@/lib/format";
 
 export const metadata: Metadata = { title: "Clients" };
 
-export default function ClientsPage() {
-  const sorted = [...clients].sort((a, b) => a.name.localeCompare(b.name));
-  const monthlyRecurring = clients
-    .filter((c) => c.status === "active")
-    .reduce((sum, c) => sum + c.monthlyFee, 0);
+type SearchParams = Promise<Record<string, string | undefined>>;
+
+export default function ClientsPage({ searchParams }: { searchParams: SearchParams }) {
+  return (
+    <Suspense fallback={<ListSkeleton label="clients" />}>
+      <ClientList searchParams={searchParams} />
+    </Suspense>
+  );
+}
+
+async function ClientList({ searchParams }: { searchParams: SearchParams }) {
+  const sp = await searchParams;
+  const { workspaces, current } = await loadAutomationContext(sp.workspace);
+  const description = "Customers you run programmes or campaigns for. A client is one company record with its status and retainer.";
+
+  if (!current) {
+    return (
+      <>
+        <PageHeader title="Clients" description={description} />
+        <EmptyState title="No workspace yet" body="Your account is not a member of a workspace. Ask an admin to add you." />
+      </>
+    );
+  }
+
+  const role = effectiveRole(current.tenantRole, current.workspaceRole);
+  const canWrite = can(role, "clients.write");
+  const params = {
+    q: sanitizeSearch(sp.q),
+    page: parsePage(sp.page),
+    filter: pickOptional(sp.status, CLIENT_STATUSES),
+    archived: parseArchived(sp.archived),
+  };
+  const result = await settle(() => listClients(current.workspaceId, params));
+  const rows = result.value?.rows ?? [];
+  const companies = await settle(() => namesById("companies", rows.map((r) => r.company_id)));
+  const contacts = await settle(() => namesById("contacts", rows.map((r) => r.primary_contact_id)));
 
   return (
     <>
       <PageHeader
         title="Clients"
-        description="Members, families and corporate accounts. Records are read-only until the Phase 3 CRUD build."
+        description={description}
+        actions={
+          canWrite ? (
+            <Link href={crmHref("/clients/new", { workspace: current.workspaceId })} className="inline-flex min-h-11 items-center rounded-lg bg-brand-600 px-4 text-sm font-medium text-white hover:bg-brand-700">
+              New client
+            </Link>
+          ) : null
+        }
       />
+      <WorkspaceSwitcher basePath="/clients" workspaces={workspaces} currentId={current.workspaceId} />
 
-      <div className="mb-6 grid grid-cols-2 gap-3 sm:gap-4 md:max-w-md">
-        <Panel>
-          <p className="text-sm text-ink-muted">Accounts</p>
-          <p className="mt-1 text-2xl font-semibold tabular-nums">{clients.length}</p>
-        </Panel>
-        <Panel>
-          <p className="text-sm text-ink-muted">Monthly recurring</p>
-          <p className="mt-1 text-2xl font-semibold tabular-nums">{formatINR(monthlyRecurring)}</p>
-        </Panel>
-      </div>
+      {!canWrite ? (
+        <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          You can view clients here. Only workspace admins can add or change them.
+        </div>
+      ) : null}
 
-      <Panel title="All clients" description="Sorted by name">
-        {sorted.length === 0 ? (
-          <EmptyState title="No clients yet" body="Clients appear here once a lead converts." />
-        ) : (
-          <DataTable
-            caption="Client accounts"
-            headers={["Name", "Type", "Plan", "Status", "Owner", "Since", "Monthly fee"]}
-            rightAlignColumns={[6]}
-            rows={sorted.map((c) => {
-              const badge = clientStatusBadge(c.status);
-              return [
-                <span key="n" className="font-medium">{c.name}</span>,
-                c.type,
-                c.plan,
-                <Badge key="s" tone={badge.tone}>{badge.label}</Badge>,
-                c.owner,
-                formatDate(c.since),
-                c.monthlyFee === 0 ? "Not billed" : formatINR(c.monthlyFee),
-              ];
-            })}
-          />
-        )}
+      <Panel>
+        <ListControls
+          basePath="/clients"
+          workspaceId={current.workspaceId}
+          q={params.q}
+          searchLabel="Search by company name"
+          searchPlaceholder="Company name"
+          filters={[
+            {
+              name: "status",
+              label: "Status",
+              value: params.filter,
+              options: [{ value: "", label: "All statuses" }, ...CLIENT_STATUSES.map((v) => ({ value: v, label: titleCase(v) }))],
+            },
+          ]}
+          archived={params.archived}
+          page={params.page}
+          pageCount={pageCount(result.value?.total ?? 0)}
+          total={result.value?.total ?? 0}
+        />
+
+        <div className="mt-5">
+          {result.error ? (
+            <QueryNotice error={result.error} />
+          ) : (
+            <DataTable
+              caption="Client accounts"
+              headers={["Company", "Status", "Primary contact", "Services", "Retainer", "Started", ""]}
+              emptyMessage={params.q || params.filter ? "No clients match these filters." : "No clients yet. Clients appear here once a company is set up as one."}
+              rightAlignColumns={[4]}
+              rows={rows.map((c) => {
+                const badge = clientStatusBadge(c.status);
+                return [
+                  <span key="c" className="flex flex-wrap items-center gap-2 font-medium">
+                    {companies.value?.get(c.company_id) ?? "Unavailable"}
+                    {c.archived_at ? <Badge tone="warning">Archived</Badge> : null}
+                  </span>,
+                  <Badge key="s" tone={badge.tone}>{badge.label}</Badge>,
+                  c.primary_contact_id ? contacts.value?.get(c.primary_contact_id) ?? "Unavailable" : "—",
+                  c.services ?? "—",
+                  c.retainer_inr ? formatINR(c.retainer_inr) : "Not set",
+                  c.started_on ? formatDate(c.started_on) : "—",
+                  <Link key="o" href={crmHref(`/clients/${c.id}`, { workspace: current.workspaceId })} className="font-medium text-brand-700 hover:underline">Open</Link>,
+                ];
+              })}
+            />
+          )}
+        </div>
       </Panel>
     </>
   );
