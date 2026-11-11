@@ -4,6 +4,9 @@ Status: PLAN ONLY. Nothing in this document has been run against production. No 
 change, rollback or deployment is approved. This revision replaces the 2026-11-10 plan, whose live-state table was wrong
 (it said 0004b and 0006b had run; the catalog shows they have not).
 
+Revised 2026-11-12 for owner decisions R1 to R4 (archive immutability, rollback safety, workflow dependencies, migration
+order). Verified on the local replica (section 8). Production has not changed in this revision.
+
 Sources of truth:
 - Production state: read-only queries on 2026-11-11 (catalog, `list_migrations`, `get_advisors`). Recorded in
   `reviews/0005_migration_reconciliation.md` and `docs/advisor-baseline.md`.
@@ -69,6 +72,10 @@ Dependencies proved on the replica (2026-11-11): 0007 fails without 0007a (`work
 0006b, 0007a or 0007; 0007a and 0007 apply without 0004b or 0006b. The only ordering constraint that fails at write time is
 4 before 5 on the drifted production shape (R4).
 
+Preflights (2026-11-12). 0006b stops with SQLSTATE 42P01 before any change if the 0004b columns, the scope keys or the
+active indexes are missing. 0007 stops if the 0007a tables, `run_workflow`, `require_ws_role` or the dedupe index are
+missing. 0008 stops if `clients` or `ws_role` is missing. Each message names the missing objects.
+
 Verify-only, never run: `0002`, `0003`, `0004`, `0005` (use `0005_verify_only.sql`), `0005a`, `0006` (partial).
 Review-only, not migrations: `0006c_rls_review.sql`, `0009_anon_hardening_notes.md`.
 
@@ -102,7 +109,8 @@ Then run `tests/local/fingerprint_surface.sql` and `tests/local/columns_surface.
 `production_digests.expected`. Any difference stops the plan.
 
 **Dependency probe (read-only, C0 and after each step).** Run `reviews/0007_0008_0006b_dependency_verify.sql` on production.
-It runs in one `begin read only` transaction and returns one row per check (81 checks). Expected today: the missing set
+It runs in one `begin read only` transaction and returns one row per check (99 checks). Observed on 2026-11-12 (read-only,
+production), the missing set
 in section 2 (archive columns, `guard_archive`, `sync_deal_status`, `clients_read`, `deals_read`, `trg_deal_status`,
 `retry_workflow_run`, `clients_readiness`, `validate_workflow_definition`, `tasks.automation_key`,
 `workflow_runs.retry_of`, `workflow_runs.attempt`, and the two unique indexes). After each step, the missing set may
@@ -123,15 +131,20 @@ Verify: the archive-drift query returns six rows.
 
 **Step 5, 0006b_gtm_rls_completion.sql.** Revokes ALL on the three tables from anon and authenticated, then grants
 SELECT, INSERT, UPDATE and DELETE to authenticated. Adds the clients and deals policies, `guard_archive`,
-`sync_deal_status` and their triggers. Rollback: `rollbacks/0006b_down.sql`, tested in path F (section 8).
-Known limit: the rollback does not restore grants, by design (section 7). Verify: `clients` and `deals` each have policies.
-Open limitations R1 (an editor can edit archived rows) and R2 (the rollback removes the company archive guard) are in the
-security report, section 2a. Owner decision needed before step 5.
+`guard_archived_immutable`, `restore_archived_record`, `archive_restore_grant`, `sync_deal_status` and their triggers.
+Its preflight refuses before any change if 0004b is missing (R4). Rollback: `rollbacks/0006b_down.sql`, tested in path F
+(section 8). Known limit: the rollback does not restore grants, by design (section 7). Verify: `clients` and `deals` each
+have policies, and `trg_archive_immutable` exists on all three tables.
+R1 (archived records are read-only for every role; restore only through `public.restore_archived_record`, for tenant owners
+and admins, audited) and R2 (`0006b_down` keeps the archive guard; its removal is a separate script,
+`rollbacks/0006b_archive_guard_down.sql`) are implemented and tested on the replica. Their status is in the security report,
+section 2a. Owner acceptance is needed before this step is approved.
 
 **Step 6, 0007a_gtm_workflow_baseline.sql.** Parity baseline. Verify the `run_workflow` body md5 is unchanged.
 No rollback file. Recovery is a restore from backup.
 
-**Step 7, 0007_gtm_automation_engine.sql.** Requires step 6 (`workflows` must exist). Revokes ALL on workflow tables from anon; revokes EXECUTE on
+**Step 7, 0007_gtm_automation_engine.sql.** Requires step 6 (`workflows` must exist); its preflight stops if it is missing. `set_priority` and `ai_draft` refuse at save
+time and at run time when `conversations` or `messages` is absent, so no run writes partial data (R3). Revokes ALL on workflow tables from anon; revokes EXECUTE on
 `run_workflow_test`, `cancel_workflow_run`, `retry_workflow_run` from PUBLIC and anon. Rollback:
 `rollbacks/0007_down.sql`, round-trip tested in path C.
 
@@ -170,8 +183,9 @@ default ACL for TRUNCATE. Rollback: `reviews/0010_gtm_least_privilege_rollback.s
 
 | Rollback | Limitation |
 | --- | --- |
-| 0004b_down | Drops archive columns. Must not run while 0006b's guard is active |
-| 0006b_down | Does not restore grants: anon stays at none, and authenticated stays at DML only (no TRUNCATE, REFERENCES, TRIGGER, MAINTAIN). This is the intended result (path F asserts it). It is not a full restoration. It also removes the companies archive guard and audit trigger, and leaves clients and deals fail closed (security report R2) |
+| 0004b_down | Drops archive columns. Refuses while the archive guard is installed (tested 2026-11-12) |
+| 0006b_down | Does not restore grants: anon stays at none, and authenticated stays at DML only (no TRUNCATE, REFERENCES, TRIGGER, MAINTAIN). This is the intended result (path F asserts it). It is not a full restoration. Since 2026-11-12 it keeps the archive guard, the restore function and the grant table, and removes only the clients and deals policies, so clients and deals fail closed (security report R2) |
+| 0006b_archive_guard_down | Removes the archive guard, restore function, grant table and both archive triggers. Needs `gtm.confirm_drop_archive_guard = 'yes'` and refuses while any archived row exists. Separate owner approval. Run by hand on a scratch replica database on 2026-11-12 (not in the harness): refusal without the setting, refusal with an archived row, success once the row is gone, and `0004b_down` runs afterwards |
 | 0007a | No rollback file. Recovery is a restore from backup (B1) |
 | 0007_down | Round-trip tested |
 | 0008_down | The Clients module shows "not configured" |
@@ -194,10 +208,15 @@ default ACL for TRUNCATE. Rollback: `reviews/0010_gtm_least_privilege_rollback.s
 Suite 30 is run only in path F: it asserts the 0006b grant state and is not part of the 0010 path.
 Suite 32 needs 0008, so it runs in paths B and E, not F.
 
-Added on 2026-11-11: suite 39 (F2 clients and deals role matrix) runs in path A (final), B (final), E (final), and path F
-(applied and reapplied). Suite 39b (fail-closed behaviour after `0006b_down`) runs in path F. The two-session dedupe race
-(`concurrency_task_dedupe.sh`) runs in path D. Result: harness exit 0, 56 passing lines, 5 expected-failure controls.
-Dedupe race: session B waited 1.99 s on session A's lock; one run and one task.
+Suite 39 (F2 clients and deals role matrix) runs in path A (final), B (final), E (final), and path F (applied and reapplied).
+Suite 39b (fail-closed behaviour after `0006b_down`) runs in path F. Suite 42 (R3: workflow dependency guard) runs in path C.
+Path A's R4 control shows 0006b refusing on the drifted schema before 0004b, and the message names the missing archived columns.
+
+Result on 2026-11-12: `run_local.sh` exit 0, 56 passing lines, 8 results reported as "observed (expected)". Four of those are
+inverted controls whose suite prints FAILED first (suites 33 and 34 on the pre-0009 surface, 36 before 0010, and 38 before
+step 4). The other four are assertions that a refusal happens (the R4 preflight, two `0006b_down` checks, and the 0010
+rollback without confirmation). Concurrency, on the same run: retry (one retry row, one task, second session refused after
+waiting on the lock) and task dedupe (session B waited 2.01 s on session A's lock; one run and one task).
 
 ## 9. Post-migration RLS verification (read-only)
 
@@ -284,7 +303,7 @@ Any other difference must be explained before the window closes.
    after a verified backup.
 8. Replica is production-shaped, not production: the 56-table scope is modelled with empty placeholder tables, and no data is copied.
 9. F3, F4, F5 and F6 are outstanding (security report section 2). The owner has not risk-accepted them.
-10. Owner decisions R1 to R6 (security report section 2a) are open. R5 and R6 are limits of this round's testing.
+10. Owner decisions (security report section 2a): R1 to R4 are implemented on the replica and need owner acceptance. R5 and R6 are open.
 
 ## 14. Leaked-password protection (research)
 
@@ -300,18 +319,22 @@ Any other difference must be explained before the window closes.
 Not requested. Request it only after blockers 1, 2, 3 and 4 are closed or explicitly accepted by the owner. The request
 must list each step, its file SHA-256, the C0 output, the verification queries, and each rollback.
 
-Steps awaiting separate owner approval (SHA-256 of the files at this commit, computed 2026-11-11):
+Steps awaiting separate owner approval (SHA-256 of the files at this commit, computed 2026-11-12). An approval is void if
+its file's hash changes. 0004b, 0007a, 0009 and 0010 are unchanged since 2026-11-11; 0006b, 0007, 0008 and the probe changed.
 
 | Order | Step | File | SHA-256 |
 | --- | --- | --- | --- |
 | 4 | 0004b_gtm_archive_columns | `supabase/migrations/0004b_gtm_archive_columns.sql` | `af864ae6153cde6356c5fff6f767c4a74f58a9a992b0d1271fab6a8d032f98f6` |
-| 5 | 0006b_gtm_rls_completion | `supabase/migrations/0006b_gtm_rls_completion.sql` | `be2ef8a21f3c15a6d045d8b876e968884cba36cf8208fa766480f3fffedbf3b4` |
+| 5 | 0006b_gtm_rls_completion | `supabase/migrations/0006b_gtm_rls_completion.sql` | `5209fccacd6384b24bc02d3c434b851e594e3def1b54e530ed10f0e5ca00dd6a` |
 | 6 | 0007a_gtm_workflow_baseline | `supabase/migrations/0007a_gtm_workflow_baseline.sql` | `d9214fc3d2868cdf0cb0705deb2384e317bdff322acf3334d48ca58100531cac` |
-| 7 | 0007_gtm_automation_engine | `supabase/migrations/0007_gtm_automation_engine.sql` | `f68563edb1a8e5abcb7b8abe79ab78500c905d7ec4a862bc74f11907161f6682` |
-| 8 | 0008_gtm_clients_readiness | `supabase/migrations/0008_gtm_clients_readiness.sql` | `94fd8fd802468fe7a6494bb6790c7ef747ac94971c5177e36eeee6dc4f8d7249` |
+| 7 | 0007_gtm_automation_engine | `supabase/migrations/0007_gtm_automation_engine.sql` | `83e36c5eb1197592a9198426579af57bed73d1ee22e79c3fc2b4b8ad8dd21a3a` |
+| 8 | 0008_gtm_clients_readiness | `supabase/migrations/0008_gtm_clients_readiness.sql` | `1136224ee4f9609c1207634a03a0ab8a03e5dac254358863a36a1302de4e5d95` |
 | 9 | 0009_anon_hardening (proposed) | `supabase/reviews/0009_anon_hardening_proposed.sql` | `13762ae13ad47be9bdb93f2f59831e773a176e187a4a0dcb56083a9184077d18` |
 | 10 | 0010_gtm_least_privilege (proposed) | `supabase/reviews/0010_gtm_least_privilege_proposed.sql` | `af111c235e7d2a9f7f1c0bbad83e4033eef7d66117e205bb3a05cdf94cf8cd75` |
-| C0 | Dependency probe (read-only; no approval needed to run) | `supabase/reviews/0007_0008_0006b_dependency_verify.sql` | `dfc8ab0c2602bf201e300b3899476d8a9f9a13a61834368f2aa791c77c36b55b` |
+| C0 | Dependency probe (read-only; no approval needed to run) | `supabase/reviews/0007_0008_0006b_dependency_verify.sql` | `27cdf7af0555571e2383e606d5999b273cafa7f52c8bed68ceab46ec98d2c40d` |
+| R | Rollback for step 4, if used | `supabase/rollbacks/0004b_down.sql` | `2e478f8d31d5ca0dae460c9d71627b1bd40bfee1438d5c587ac681d9d1684767` |
+| R | Rollback for step 5, if used | `supabase/rollbacks/0006b_down.sql` | `76e42bca6d7b22273d1025a247bc1fa25e336d9f40cc294e424f59675373baed` |
+| R | Archive-guard removal, separate, if used | `supabase/rollbacks/0006b_archive_guard_down.sql` | `1afc1dc6e04a1d6b270dcd87f4feb1c8cd963a6cef44cfd1b2c31e2308925d35` |
 
 Each approval covers only the named file and hash. If a hash differs at execution, stop and re-approve. Verify-only
 items (0002, 0003, 0004, 0005 via `0005_verify_only.sql`) and 0005a (not reviewed) are not in this table.

@@ -15,6 +15,25 @@
 --     REFERENCES or TRIGGER). authenticated must hold SELECT, INSERT, UPDATE and DELETE.
 --
 -- Rollback: supabase/rollbacks/0008_down.sql. It drops the function and nothing else.
+--
+-- Prerequisites (R4): public.clients and app_private.ws_role(uuid, uuid). It does not need 0004b, 0006b, 0007a or 0007.
+-- Until 0006b creates the clients policies, the function reports not_configured. That is expected, not an error.
+
+-- 0. Preflight (R4). Stops before any change when a prerequisite is missing.
+do $$
+declare
+  v_missing text := '';
+begin
+  if to_regclass('public.clients') is null then
+    v_missing := v_missing || ' table public.clients (0004);';
+  end if;
+  if to_regprocedure('app_private.ws_role(uuid,uuid)') is null then
+    v_missing := v_missing || ' function app_private.ws_role(uuid,uuid) (base);';
+  end if;
+  if v_missing <> '' then
+    raise exception 'preflight failed for 0008; missing:%. No change was made.', v_missing using errcode = '42P01';
+  end if;
+end $$;
 
 create or replace function public.clients_readiness()
 returns jsonb

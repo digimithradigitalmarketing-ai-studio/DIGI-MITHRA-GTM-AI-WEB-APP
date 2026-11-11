@@ -102,6 +102,9 @@ insert into public.pipeline_stages (id, tenant_id, workspace_id, name, "position
 -- W3: a draft with two nodes. Node 2 is valid to save but fails at run time on purpose: set_priority
 -- casts the payload's conversation_id, and the T3 run passes a value that is not a uuid.
 -- WB: tenant B's own workflow, used to show that B can still run its own workflows.
+-- Without public.conversations, 0007's save-time check refuses the W3 draft (R3). The fixture is inserted with that
+-- check off, as suite 42 does; the run-time refusal is what this suite exercises, and the check is back on afterwards.
+alter table public.workflows disable trigger trg_validate_definition;
 insert into public.workflows (id, tenant_id, workspace_id, name, trigger_type, status, definition) values
   ('a3000000-0000-4000-8000-0000000000a1', 'a1000000-0000-4000-8000-00000000000a', 'a2000000-0000-4000-8000-0000000000a1',
    'Lead follow-up', 'lead_created', 'active',
@@ -112,6 +115,7 @@ insert into public.workflows (id, tenant_id, workspace_id, name, trigger_type, s
   ('b3000000-0000-4000-8000-0000000000b1', 'b1000000-0000-4000-8000-00000000000b', 'b2000000-0000-4000-8000-0000000000b1',
    'Tenant B follow-up', 'lead_created', 'active',
    '{"nodes":[{"type":"create_task","config":{"title":"B follow up"}},{"type":"end"}]}');
+alter table public.workflows enable trigger trg_validate_definition;
 
 -- ----------------------------------------------------------------- P. privileges and shape
 select pg_temp.assert_ok('P1 anon has no privileges on the workflow tables',

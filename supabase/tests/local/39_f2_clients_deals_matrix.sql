@@ -9,6 +9,8 @@
 --   deals write      owner, admin, manager, editor (insert, update); owner or admin only (delete)
 --   companies write  owner, admin, manager, editor (insert, update); owner or admin only (delete)
 --   archive          owner or admin only. guard_archive raises 42501 for a manager or editor who passes RLS.
+--   archived rows    read-only for every role (R1). guard_archived_immutable raises 42501 for update and delete.
+--                    The only restore is public.restore_archived_record(table, id): tenant owner or admin, audited.
 --
 -- Each denial is checked at the database by its mechanism:
 --   * a refused INSERT, or a row that fails WITH CHECK, raises 42501;
@@ -386,6 +388,15 @@ begin
   end loop;
 end $$;
 
+-- A statement that must succeed. Any error fails the suite.
+create function pg_temp.expect_ok(p_label text, p_sql text) returns void language plpgsql as $$
+begin
+  execute p_sql;
+exception
+  when others then
+    raise exception 'FAIL %: expected success, got % (%)', p_label, sqlstate, sqlerrm using errcode = 'P0100';
+end $$;
+
 -- ----------------------------------------------------------------- 5. archive matrix (guard and RLS)
 -- Companies and deals: manager and editor pass RLS for update, so the guard refuses them with 42501. Other roles fail
 -- RLS and touch zero rows. Clients: manager and editor fail RLS and touch zero rows.
@@ -416,25 +427,75 @@ begin
   perform pg_temp.expect_one('owner archives client',  $q$update public.clients set archived_at = now() where id = 'b7000000-0000-4000-8000-0000000000a2'$q$);
   perform pg_temp.expect_one('owner archives deal',    $q$update public.deals set archived_at = now() where id = 'b8000000-0000-4000-8000-0000000000a2'$q$);
 
-  -- Observed, not a requirement: an editor may still edit a record that is archived (the guard only checks archived_at).
-  -- This is recorded so a change to it is noticed. It is an owner decision whether this should be refused.
+  -- R1. An archived record is read-only for every role. Each refusal is SQLSTATE 42501 from guard_archived_immutable.
+  -- The editor passes RLS for these rows, so the refusal comes from the trigger, not from RLS.
   perform pg_temp.act_as('b0000000-0000-4000-8000-000000000004');
-  perform pg_temp.expect_one('editor edits an archived deal (observed)', $q$update public.deals set title = 'edit-archived' where id = 'b8000000-0000-4000-8000-0000000000a2'$q$);
+  perform pg_temp.expect_error('editor edits an archived deal (immutable)',
+    $q$update public.deals set title = 'edit-archived' where id = 'b8000000-0000-4000-8000-0000000000a2'$q$, '42501');
+  perform pg_temp.expect_error('editor edits an archived company (immutable)',
+    $q$update public.companies set name = 'edit-archived' where id = 'b6000000-0000-4000-8000-0000000000a1'$q$, '42501');
+  -- deals_delete is admin-only, so RLS hides the archived row from the editor and the delete matches zero rows
+  -- with no error. The row must still be there afterwards; that is the immutability being tested.
+  perform pg_temp.expect_count('editor delete of an archived deal removes no row',
+    $q$with d as (delete from public.deals where id = 'b8000000-0000-4000-8000-0000000000a2' returning 1) select count(*) from d$q$, 0);
+  perform pg_temp.expect_count('archived deal still present after the editor delete',
+    $q$select count(*) from public.deals where id = 'b8000000-0000-4000-8000-0000000000a2'$q$, 1);
+  perform pg_temp.expect_error('editor restores an archived deal by update (immutable)',
+    $q$update public.deals set archived_at = null where id = 'b8000000-0000-4000-8000-0000000000a2'$q$, '42501');
+  perform pg_temp.expect_error('editor calls the restore function (role)',
+    $q$select public.restore_archived_record('deals', 'b8000000-0000-4000-8000-0000000000a2')$q$, '42501');
 
   perform pg_temp.act_as('b0000000-0000-4000-8000-000000000002');
-  perform pg_temp.expect_one('admin restores company', $q$update public.companies set archived_at = null where id = 'b6000000-0000-4000-8000-0000000000a1'$q$);
-  perform pg_temp.expect_one('admin restores client',  $q$update public.clients set archived_at = null where id = 'b7000000-0000-4000-8000-0000000000a2'$q$);
-  perform pg_temp.expect_one('admin restores deal',    $q$update public.deals set archived_at = null where id = 'b8000000-0000-4000-8000-0000000000a2'$q$);
-  perform pg_temp.expect_one('admin archives and restores a new deal',
+  perform pg_temp.expect_error('admin edits an archived deal (immutable)',
+    $q$update public.deals set title = 'edit-archived' where id = 'b8000000-0000-4000-8000-0000000000a2'$q$, '42501');
+  perform pg_temp.expect_error('admin clears archived_at by update (only the restore function may)',
+    $q$update public.clients set archived_at = null where id = 'b7000000-0000-4000-8000-0000000000a2'$q$, '42501');
+  perform pg_temp.expect_error('admin deletes an archived client (immutable)',
+    $q$delete from public.clients where id = 'b7000000-0000-4000-8000-0000000000a2'$q$, '42501');
+  perform pg_temp.expect_error('admin writes the restore grant table directly',
+    $q$insert into app_private.archive_restore_grant (txid, table_name, record_id) values (1, 'deals', 'b8000000-0000-4000-8000-0000000000a2')$q$, '42501');
+  perform pg_temp.expect_error('admin reads the restore grant table directly',
+    $q$select count(*) from app_private.archive_restore_grant$q$, '42501');
+  perform pg_temp.expect_error('restore of a record that is not archived',
+    $q$select public.restore_archived_record('deals', 'b8000000-0000-4000-8000-0000000000a1')$q$, '22023');
+  perform pg_temp.expect_error('restore from a table outside the GTM set',
+    $q$select public.restore_archived_record('audit_logs', 'b8000000-0000-4000-8000-0000000000a2')$q$, '22023');
+  perform pg_temp.expect_error('restore of an unknown record',
+    $q$select public.restore_archived_record('deals', 'b8000000-0000-4000-8000-00000000ffff')$q$, 'P0002');
+
+  -- Restores through the function. Each writes one 'restore' audit row (section 7).
+  perform pg_temp.expect_ok('admin restores company', $q$select public.restore_archived_record('companies', 'b6000000-0000-4000-8000-0000000000a1')$q$);
+  perform pg_temp.expect_ok('admin restores client',  $q$select public.restore_archived_record('clients', 'b7000000-0000-4000-8000-0000000000a2')$q$);
+  perform pg_temp.expect_ok('admin restores deal',    $q$select public.restore_archived_record('deals', 'b8000000-0000-4000-8000-0000000000a2')$q$);
+  perform pg_temp.expect_one('admin edits the restored deal', $q$update public.deals set title = 'restored' where id = 'b8000000-0000-4000-8000-0000000000a2'$q$);
+
+  -- Archive by insert, then restore through the function. archived_by is cleared by the restore.
+  perform pg_temp.expect_one('admin archives a new deal on insert',
     $q$insert into public.deals (tenant_id, workspace_id, title, stage_id, archived_at) values ('b1000000-0000-4000-8000-0000000000a0', 'b2000000-0000-4000-8000-0000000000a1', 'arc-admin', 'b5000000-0000-4000-8000-0000000000a1', now())$q$);
+  -- archived_by is recorded on the insert itself, before the restore clears it.
+  perform pg_temp.expect_count('insert of an archived deal records the admin as archived_by',
+    $q$select count(*) from public.deals where title = 'arc-admin' and archived_by = 'b0000000-0000-4000-8000-000000000002'::uuid$q$, 1);
+  perform pg_temp.expect_ok('admin restores the new archived deal',
+    $q$select public.restore_archived_record('deals', (select id from public.deals where title = 'arc-admin'))$q$);
+
+  -- Cross-tenant: the tenant B admin cannot restore a tenant T record, even though it is archived. Re-archive, then try.
+  perform pg_temp.expect_one('owner re-archives deal a2',
+    $q$update public.deals set archived_at = now() where id = 'b8000000-0000-4000-8000-0000000000a2'$q$);
+  perform pg_temp.act_as((select f.uid from f2_users f where f.label = 'badmin'));
+  perform pg_temp.expect_error('tenant B admin restores a tenant T deal (cross-tenant)',
+    $q$select public.restore_archived_record('deals', 'b8000000-0000-4000-8000-0000000000a2')$q$, '42501');
+
+  perform pg_temp.act_as('b0000000-0000-4000-8000-000000000001');
+  perform pg_temp.expect_ok('owner restores deal a2 after the refused cross-tenant attempt',
+    $q$select public.restore_archived_record('deals', 'b8000000-0000-4000-8000-0000000000a2')$q$);
 end $$;
 
--- archived_by must be the caller who archived, and null after restore.
+-- archived_by is recorded on archive (checked above) and null after restore.
 select pg_temp.act_as_postgres();
 do $$
 begin
-  if (select archived_by from public.deals where title = 'arc-admin') is distinct from 'b0000000-0000-4000-8000-000000000002'::uuid then
-    raise exception 'FAIL 5: an admin insert of an archived deal did not record archived_by' using errcode = 'P0100';
+  if (select archived_by from public.deals where title = 'arc-admin') is not null then
+    raise exception 'FAIL 5: archived_by was not cleared by the restore of arc-admin' using errcode = 'P0100';
   end if;
   if (select archived_by from public.deals where id = 'b8000000-0000-4000-8000-0000000000a2') is not null then
     raise exception 'FAIL 5: a restored deal still records archived_by' using errcode = 'P0100';
@@ -530,6 +591,19 @@ begin
               where a.actor_id = 'b0000000-0000-4000-8000-000000000004' and a.entity = 'companies'
                 and a.entity_id = 'b6000000-0000-4000-8000-0000000000a1' and a.action = 'update') then
     raise exception 'FAIL 7: a refused archive by the editor left an audit row' using errcode = 'P0100';
+  end if;
+  -- R1. Each successful restore writes one 'restore' row with the admin as actor. Refused restores write none.
+  if (select count(*) from public.audit_logs a
+       where a.action = 'restore' and a.actor_id = 'b0000000-0000-4000-8000-000000000002'
+         and a.entity_id in ('b6000000-0000-4000-8000-0000000000a1', 'b7000000-0000-4000-8000-0000000000a2',
+                             'b8000000-0000-4000-8000-0000000000a2')) < 3 then
+    raise exception 'FAIL 7: restores through restore_archived_record left no restore audit rows' using errcode = 'P0100';
+  end if;
+  if exists (select 1 from public.audit_logs a
+              where a.action = 'restore'
+                and a.actor_id in ('b0000000-0000-4000-8000-000000000004', 'b0000000-0000-4000-8000-000000000001')
+                and a.entity_id = 'b8000000-0000-4000-8000-0000000000a1') then
+    raise exception 'FAIL 7: a refused restore left a restore audit row' using errcode = 'P0100';
   end if;
   -- An admin delete is audited with the admin as actor.
   if not exists (select 1 from public.audit_logs a

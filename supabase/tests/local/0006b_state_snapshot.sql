@@ -6,7 +6,7 @@
 --   policy   every policy on companies, clients and deals
 --   rls      RLS flag on companies, clients and deals
 --   trigger  every non-internal trigger on companies, clients and deals
---   function the archive-guard and status functions (md5 of the body, or 'absent')
+--   function the archive-guard, immutability, restore and status functions (md5 of the body, or 'absent')
 --   column   every column of companies, clients and deals (name, type, nullability)
 --   table    the ACL of EVERY table in public (aclexplode), so collateral grant changes are visible
 select 'policy ' || tablename || ' ' || policyname || ' ' || cmd || ' ' || array_to_string(roles, ',')
@@ -25,7 +25,8 @@ union all
 select 'function ' || f.fn || ' ' || coalesce((
          select md5(pg_get_functiondef(p.oid)) from pg_proc p
           where p.oid = to_regprocedure(f.fn)), 'absent')
-  from (values ('app_private.guard_archive()'), ('app_private.sync_deal_status()')) as f(fn)
+  from (values ('app_private.guard_archive()'), ('app_private.guard_archived_immutable()'),
+               ('app_private.sync_deal_status()'), ('public.restore_archived_record(text,uuid)')) as f(fn)
 union all
 select 'column ' || c.table_name || '.' || c.column_name || ' ' || c.data_type || ' null=' || c.is_nullable
   from information_schema.columns c

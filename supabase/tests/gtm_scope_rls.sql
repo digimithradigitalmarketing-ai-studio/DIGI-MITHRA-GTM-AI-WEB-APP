@@ -421,11 +421,13 @@ do $$ declare v int; begin
   end if;
 end $$;
 
--- E3: positive, admin restores the company, and archived_by is cleared
-do $$ declare v int; begin
-  update public.companies set archived_at = null where id = 'c1000000-0000-4000-8000-0000000000a1';
-  get diagnostics v = row_count;
-  if v <> 1 then raise exception 'FAIL E3: admin could not restore a company'; end if;
+-- E3: positive, admin restores the company through restore_archived_record (R1: the only restore path), and
+-- archived_by is cleared. A direct update that clears archived_at is refused (see 39_f2 section 5).
+do $$ begin
+  perform public.restore_archived_record('companies', 'c1000000-0000-4000-8000-0000000000a1');
+  if (select archived_at from public.companies where id = 'c1000000-0000-4000-8000-0000000000a1') is not null then
+    raise exception 'FAIL E3: admin could not restore a company';
+  end if;
   if exists (select 1 from public.companies
               where id = 'c1000000-0000-4000-8000-0000000000a1' and archived_by is not null) then
     raise exception 'FAIL E3b: archived_by not cleared on restore';

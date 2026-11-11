@@ -298,7 +298,7 @@ begin
 end $$;
 
 select pg_temp.act_as('c0000000-0000-4000-8000-00000000c001');
-update public.companies set archived_at = null where id = 'f1000000-0000-4000-8000-00000000c004';
+select public.restore_archived_record('companies', 'f1000000-0000-4000-8000-00000000c004');
 select pg_temp.act_as_postgres();
 do $$
 begin

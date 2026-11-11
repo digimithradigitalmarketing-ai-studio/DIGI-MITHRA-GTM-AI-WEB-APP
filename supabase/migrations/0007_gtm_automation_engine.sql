@@ -20,6 +20,43 @@
 --
 -- Not applied to production. Requires a verified backup and separate approval.
 -- Rollback: supabase/rollbacks/0007_down.sql.
+--
+-- Dependencies (R3, R4). Two node types write to inbox tables that no repo migration creates:
+--   * set_priority  updates public.conversations (id, tenant_id, workspace_id, priority NOT NULL)
+--   * ai_draft      inserts into public.messages (id, tenant_id, workspace_id, conversation_id, direction, body,
+--                   sender_name, is_ai_draft), and only when the payload has a conversation_id
+-- Both tables exist on production (catalog read on 2026-11-12) with every column above. This file does not create them.
+-- If a database lacks them, saving a workflow with those nodes is refused (validate_workflow_definition), and a run that
+-- reaches one records a failed step with a named error. No partial write is kept. No replacement table is created.
+--
+-- Preflight (R4): the 0007a objects this file depends on. It stops before any change when one is missing.
+
+-- Preflight (R4). Stops before any change when a 0007a object is missing. Run 0007a first.
+do $$
+declare
+  v_missing text := '';
+  t text;
+begin
+  foreach t in array array['workflows', 'workflow_versions', 'workflow_runs', 'workflow_steps', 'notifications', 'tasks', 'contacts'] loop
+    if to_regclass('public.' || t) is null then
+      v_missing := v_missing || ' table public.' || t || ';';
+    end if;
+  end loop;
+  if to_regprocedure('app_private.run_workflow(uuid,jsonb,text)') is null then
+    v_missing := v_missing || ' function app_private.run_workflow(uuid,jsonb,text) (0007a);';
+  end if;
+  if to_regprocedure('app_private.require_ws_role(uuid,uuid,text[])') is null then
+    v_missing := v_missing || ' function app_private.require_ws_role(uuid,uuid,text[]) (0007a);';
+  end if;
+  if not exists (select 1 from pg_indexes where schemaname = 'public' and tablename = 'workflow_runs'
+                    and indexdef ilike 'CREATE UNIQUE INDEX%(workflow_id, dedupe_key)%') then
+    v_missing := v_missing || ' unique index on workflow_runs (workflow_id, dedupe_key) (0007a, used by run_workflow);';
+  end if;
+  if v_missing <> '' then
+    raise exception 'preflight failed for 0007; missing:%. Apply 0007a_gtm_workflow_baseline.sql first. No change was made.', v_missing
+      using errcode = '42P01';
+  end if;
+end $$;
 
 -- ---------------------------------------------------------------------------
 -- 0. Privileges. authenticated keeps its grants, and every read and write still goes through RLS.
@@ -61,6 +98,20 @@ create unique index if not exists workflow_runs_one_retry_uniq
 --    time. It mirrors src/lib/automations/definition.ts (validateDefinition). Keep the two in step.
 --    It runs only when the definition changes, so a status-only edit never re-validates old rows.
 -- ---------------------------------------------------------------------------
+-- Named dependency check (R3). Used before any write to a table this repo does not create.
+create or replace function app_private.require_relation(p_name text)
+returns void
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if to_regclass(p_name) is null then
+    raise exception 'this automation step needs %, which this database does not have; the step was not run', p_name
+      using errcode = '42P01';
+  end if;
+end
+$$;
+
 create or replace function app_private.check_node_field(
   p_pos integer, p_type text, p_cfg jsonb, p_key text, p_kind text, p_required boolean,
   p_min integer, p_max integer, p_allowed text[] default null)
@@ -149,6 +200,14 @@ begin
       cfg := '{}'::jsonb;
     elsif jsonb_typeof(cfg) <> 'object' then
       raise exception 'node % (%): config must be an object', n, ntype using errcode = '22023';
+    end if;
+
+    -- R3: refuse at save time a node whose inbox table this database does not have.
+    if ntype = 'set_priority' and to_regclass('public.conversations') is null then
+      raise exception 'node % (set_priority) needs public.conversations, which this database does not have', n using errcode = '22023';
+    end if;
+    if ntype = 'ai_draft' and to_regclass('public.messages') is null then
+      raise exception 'node % (ai_draft) needs public.messages, which this database does not have', n using errcode = '22023';
     end if;
 
     case ntype
@@ -286,6 +345,7 @@ begin
         values (wf.tenant_id, wf.workspace_id, v_run, i, 'add_tag', 'completed', jsonb_build_object('tag', cfg->>'tag'));
 
       when 'set_priority' then
+        perform app_private.require_relation('public.conversations');
         update public.conversations set priority = coalesce(cfg->>'priority', 'high')
         where id = (p_payload->>'conversation_id')::uuid and workspace_id = wf.workspace_id;
         insert into public.workflow_steps (tenant_id, workspace_id, run_id, position, node_type, status, output)
@@ -303,6 +363,7 @@ begin
         if p_payload ? 'conversation_id' then
           v_text := app_private.render_template(coalesce(cfg->>'template',
             'Hi {{name}}, thanks for reaching out to {{business}}! Our team will get back to you shortly.'), p_payload, wf.workspace_id);
+          perform app_private.require_relation('public.messages');
           insert into public.messages (tenant_id, workspace_id, conversation_id, direction, body, sender_name, is_ai_draft)
           values (wf.tenant_id, wf.workspace_id, (p_payload->>'conversation_id')::uuid, 'outbound', v_text, 'AI draft', true);
           insert into public.workflow_steps (tenant_id, workspace_id, run_id, position, node_type, status, output)

@@ -67,8 +67,9 @@ base() {
 RESULTS="$HERE/results"
 mkdir -p "$RESULTS"
 
-# Path A: the live project's history. Migrations 0002 to 0005, then the partial 0006
-# state, then the production archive drift, then 0006b, then 0004b. This is what production needs.
+# Path A: the live project's history, in production's real order. Migrations 0002 to 0005, then the partial 0006
+# state and the production archive drift. 0004b must run before 0006b (R4), so 0006b is first asked to run on the
+# drifted schema, where its preflight must refuse. Then 0004b, then 0006b.
 new_db gtm_local_live_replay
 base gtm_local_live_replay
 MD5_A="$(baseline_md5 gtm_local_live_replay)"
@@ -77,19 +78,25 @@ for m in 0002_gtm_scope_keys 0003_gtm_scoped_crm_foreign_keys 0004_gtm_companies
 done
 run gtm_local_live_replay "$HERE/02_live_partial_state.sql"
 run gtm_local_live_replay "$HERE/02b_live_archive_drift.sql"   # local fixture: matches the live catalog
-run gtm_local_live_replay "$SUPA/migrations/0006b_gtm_rls_completion.sql"
 
-# Before 0004b, the drifted schema must fail the suite: guard_archive reads archived_at on writes.
-# This check is inverted. The suite passing here would mean the drift is not reproduced.
+# R4 control. On the drifted schema, 0006b must refuse before it changes anything: its preflight names the missing
+# archived_at column and points at 0004b. This check is inverted. A successful 0006b here would mean the guard is missing.
 FAIL=0
-if run_suite gtm_local_live_replay "$SUPA/tests/gtm_scope_rls.sql" "$MD5_A" pre-0004b; then
-  echo "UNEXPECTED: drifted live schema passed gtm_scope_rls.sql before 0004b" >&2
+R4_LOG="$RESULTS/gtm_local_live_replay.preflight_0006b.log"
+if "${PSQL[@]}" -d gtm_local_live_replay -f "$SUPA/migrations/0006b_gtm_rls_completion.sql" >"$R4_LOG" 2>&1; then
+  echo "UNEXPECTED: 0006b ran on the drifted schema without 0004b" >&2
   FAIL=1
+elif grep -q "preflight failed for 0006b; missing:.*archived_at (0004b)" "$R4_LOG" \
+  && [ "$("${PSQL[@]}" -At -d gtm_local_live_replay -c "select to_regprocedure('app_private.guard_archive()') is null")" = "t" ]; then
+  echo "observed (expected): 0006b preflight refuses the drifted schema and changes nothing (0004b not applied)"
 else
-  echo "observed (expected): drifted live schema fails gtm_scope_rls.sql before 0004b"
+  echo "FAILED: 0006b was refused for another reason, or left objects behind (see $R4_LOG)" >&2
+  FAIL=1
 fi
 
 run gtm_local_live_replay "$SUPA/migrations/0004b_gtm_archive_columns.sql"
+run gtm_local_live_replay "$SUPA/migrations/0006b_gtm_rls_completion.sql"
+# Final suites on this path run after 0006b; see the loop below.
 # Phase 5. 0007a records the live workflow engine (a no-op on production), then 0007 extends it.
 run gtm_local_live_replay "$SUPA/migrations/0007a_gtm_workflow_baseline.sql"
 run gtm_local_live_replay "$SUPA/migrations/0007_gtm_automation_engine.sql"
@@ -154,6 +161,8 @@ SNAP="$SUPA/tests/local/rollback_acl_snapshot.sql"
 PSQL_SNAP=(psql -X -q -t -A -v ON_ERROR_STOP=1 -h "$PGHOST" -p "$PGPORT" -U postgres -d gtm_local_rollback)
 "${PSQL_SNAP[@]}" -f "$SNAP" > "$RESULTS/rollback.pre_0007.acl.txt"
 run gtm_local_rollback "$SUPA/migrations/0007_gtm_automation_engine.sql"
+# R3: the workflow dependency guard, where conversations and messages are absent (rolled back).
+run_suite gtm_local_rollback "$HERE/42_workflow_dependency_guard.sql" unused || FAIL=1
 run gtm_local_rollback "$SUPA/rollbacks/0007_down.sql"
 "${PSQL_SNAP[@]}" -f "$SNAP" > "$RESULTS/rollback.post_down.acl.txt"
 if diff -u "$RESULTS/rollback.pre_0007.acl.txt" "$RESULTS/rollback.post_down.acl.txt"; then
@@ -184,7 +193,7 @@ check_digests() {  # $1 = label, $2 = sql file, $3 = check prefix
 }
 check_digests fingerprint "$HERE/fingerprint_surface.sql" fingerprint
 # Same order production has: 0002 to 0005 (already applied to the live catalog, which is why contacts.company_id
-# exists), then the partial 0006 state and archive drift from path A, then 0006b, 0004b and the workflow migrations.
+# exists), then the partial 0006 state and archive drift from path A, then 0004b, 0006b and the workflow migrations (R4).
 # Any failure here stops the path: a migration error must never be silently skipped.
 for m in 0002_gtm_scope_keys 0003_gtm_scoped_crm_foreign_keys 0004_gtm_companies_clients_deals 0005_gtm_company_links; do
   run gtm_local_prod_surface "$SUPA/migrations/$m.sql" || { echo "FAILED: surface migration $m" >&2; exit 1; }
@@ -193,7 +202,7 @@ done
 check_digests columns "$HERE/columns_surface.sql" columns
 run gtm_local_prod_surface "$HERE/02_live_partial_state.sql" || { echo "FAILED: live partial state" >&2; exit 1; }
 run gtm_local_prod_surface "$HERE/02b_live_archive_drift.sql" || { echo "FAILED: archive drift" >&2; exit 1; }
-for m in 0006b_gtm_rls_completion 0004b_gtm_archive_columns 0007a_gtm_workflow_baseline 0007_gtm_automation_engine 0008_gtm_clients_readiness; do
+for m in 0004b_gtm_archive_columns 0006b_gtm_rls_completion 0007a_gtm_workflow_baseline 0007_gtm_automation_engine 0008_gtm_clients_readiness; do
   run gtm_local_prod_surface "$SUPA/migrations/$m.sql" || { echo "FAILED: surface migration $m" >&2; exit 1; }
 done
 
@@ -260,10 +269,12 @@ echo "surface path complete: advisor output in $RESULTS/gtm_local_prod_surface.a
 PGHOST="$PGHOST" PGPORT="$PGPORT" "$HERE/concurrency_retry.sh" || FAIL=1
 PGHOST="$PGHOST" PGPORT="$PGPORT" "$HERE/concurrency_task_dedupe.sh" || FAIL=1
 
-# Path F: 0006b round trip, in production order. 0004b must come first: the archive guard in 0006b reads archived_at,
-# and production has no archived_* columns yet. The snapshot S0 is taken before 0006b, S1 after it, S2 after
-# 0006b_down, and S3 after the reapply. Expected: S2 differs from S0 only in the table ACL lines for companies,
-# clients and deals (the grants 0006b_down deliberately does not restore). S3 must equal S1 exactly.
+# Path F: 0006b round trip, in production order. 0004b must come first (R4): the archive protection in 0006b reads
+# archived_at, and production has no archived_* columns yet. The snapshot S0 is taken before 0006b, S1 after it, S2
+# after 0006b_down, and S3 after the reapply. R2 (revised): 0006b_down removes only the clients and deals policies.
+# Expected, checked below: (a) S1 to S2 removes exactly the 8 clients_* and deals_* policy lines and adds nothing;
+# (b) S0 to S2 differs only by the table ACL lines (grants not restored), and the retained archive-protection
+# triggers and functions. S3 must equal S1 exactly.
 FSNAP="$HERE/0006b_state_snapshot.sql"
 new_db gtm_local_0006b
 base gtm_local_0006b
@@ -291,16 +302,27 @@ run_suite gtm_local_0006b "$HERE/39b_0006b_rollback_fail_closed.sql" "$MD5_F" 00
 # REFERENCES, TRIGGER or MAINTAIN), and the rest of the state that must return to the baseline.
 "${PSQL[@]}" -d gtm_local_0006b -f "$HERE/37_0006b_rollback_asserts.sql" > "$RESULTS/0006b.asserts.log" 2>&1 \
   || { echo "FAILED: path F rollback asserts (see $RESULTS/0006b.asserts.log)" >&2; tail -n 3 "$RESULTS/0006b.asserts.log" >&2; FAIL=1; }
-# Expected differences only: the table ACL lines for companies, clients and deals.
-UNEXPECTED="$(diff "$RESULTS/0006b.S0.snap.txt" "$RESULTS/0006b.S2.snap.txt" | grep '^[<>]' \
-  | grep -v -E '^[<>] table (companies|clients|deals) ' || true)"
-EXPECTED_N="$(diff "$RESULTS/0006b.S0.snap.txt" "$RESULTS/0006b.S2.snap.txt" | grep -c -E '^[<>] table (companies|clients|deals) ' || true)"
-if [ -n "$UNEXPECTED" ]; then
-  echo "FAILED: path F 0006b_down changed objects outside the expected grant set:" >&2; echo "$UNEXPECTED" >&2; FAIL=1
-elif [ "$EXPECTED_N" -eq 0 ]; then
-  echo "FAILED: path F expected the intentional grant difference and saw none (the check is blind)" >&2; FAIL=1
+# (a) Applied to rolled-back: the only difference must be the 8 removed clients_* and deals_* policy lines.
+S1_S2_OTHER="$(diff "$RESULTS/0006b.S1.snap.txt" "$RESULTS/0006b.S2.snap.txt" | grep '^[<>]' \
+  | grep -v -E '^< policy (clients|deals) ' || true)"
+S1_S2_REMOVED="$(diff "$RESULTS/0006b.S1.snap.txt" "$RESULTS/0006b.S2.snap.txt" | grep -c -E '^< policy (clients|deals) ' || true)"
+if [ -n "$S1_S2_OTHER" ] || [ "$S1_S2_REMOVED" -ne 8 ]; then
+  echo "FAILED: path F 0006b_down changed more than the clients and deals policies (removed: $S1_S2_REMOVED):" >&2
+  echo "$S1_S2_OTHER" >&2; FAIL=1
 else
-  echo "observed (expected): 0006b_down restores all objects except $EXPECTED_N table ACL line(s) for companies, clients, deals"
+  echo "observed (expected): 0006b_down removes exactly $S1_S2_REMOVED clients and deals policies and nothing else"
+fi
+# (b) Baseline to rolled-back: only grants (not restored) and the archive-protection objects 0006b keeps may differ.
+S0_S2_OTHER="$(diff "$RESULTS/0006b.S0.snap.txt" "$RESULTS/0006b.S2.snap.txt" | grep '^[<>]' \
+  | grep -v -E '^[<>] (table (companies|clients|deals)|trigger (companies|clients|deals)|function (app_private\.(guard_archive|guard_archived_immutable|sync_deal_status)\(\)|public\.restore_archived_record\(text,uuid\))) ' || true)"
+EXPECTED_ACL="$(diff "$RESULTS/0006b.S0.snap.txt" "$RESULTS/0006b.S2.snap.txt" | grep -c -E '^[<>] table (companies|clients|deals) ' || true)"
+KEPT_N="$(diff "$RESULTS/0006b.S0.snap.txt" "$RESULTS/0006b.S2.snap.txt" | grep -c -E '^[<>] (trigger|function) ' || true)"
+if [ -n "$S0_S2_OTHER" ]; then
+  echo "FAILED: path F 0006b_down changed objects outside the expected set:" >&2; echo "$S0_S2_OTHER" >&2; FAIL=1
+elif [ "$EXPECTED_ACL" -eq 0 ] || [ "$KEPT_N" -eq 0 ]; then
+  echo "FAILED: path F expected the grant and kept-object differences and saw none (the check is blind)" >&2; FAIL=1
+else
+  echo "observed (expected): 0006b_down keeps archive protection ($KEPT_N trigger and function lines) and leaves $EXPECTED_ACL table ACL line(s) for companies, clients, deals"
 fi
 # Reapply 0006b and rerun. S3 must equal S1 exactly, so the migration is idempotent after a rollback.
 run gtm_local_0006b "$SUPA/migrations/0006b_gtm_rls_completion.sql" || { echo "FAILED: path F 0006b reapply" >&2; exit 1; }

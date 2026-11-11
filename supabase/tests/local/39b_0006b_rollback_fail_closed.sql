@@ -3,12 +3,12 @@
 -- with ROLLBACK. It checks what the rollback leaves behind for application roles, so the difference from the applied
 -- state is known and not assumed.
 --
--- Expected after the rollback:
+-- Expected after the rollback (R2, revised: the rollback keeps archive protection):
 --   * clients and deals keep RLS enabled but have NO policies. Every app role reads zero rows and every write is refused.
 --     The application's readiness check then reports the module as not configured.
---   * companies keeps the four 0006 policies, but the 0006b archive guard and audit trigger are gone. An editor or manager
---     who passes the companies_update policy can archive a company. This is an observed limitation of the rollback, recorded
---     here so it is visible. It is not a fix.
+--   * companies keeps the four 0006 policies AND the archive guard, the immutability trigger and the audit trigger.
+--     Only an owner or admin can archive a company, and an archived company is read-only for everyone.
+--   * The restore function public.restore_archived_record still works for an owner or admin, and it is audited.
 --   * anon holds no privilege on the three tables (grants are not restored by the rollback).
 
 create function pg_temp.act_as(p_user uuid) returns void language plpgsql as $$
@@ -50,6 +50,14 @@ begin
   execute p_sql;
   get diagnostics n = row_count;
   if n <> 0 then raise exception 'FAIL %: % rows changed', p_label, n using errcode = 'P0100'; end if;
+end $$;
+
+create function pg_temp.expect_ok(p_label text, p_sql text) returns void language plpgsql as $$
+begin
+  execute p_sql;
+exception
+  when others then
+    raise exception 'FAIL %: expected success, got % (%)', p_label, sqlstate, sqlerrm using errcode = 'P0100';
 end $$;
 
 -- Fixture (as postgres): one tenant, one workspace, an owner and an editor, one company and one client and one deal.
@@ -101,12 +109,37 @@ begin
 end $$;
 reset role;
 
--- 3. Companies keep RLS and the 0006 policies, but the 0006b archive guard is gone. Observed limitation, asserted so it is visible.
+-- 3. Archive protection survives the rollback (R2).
+-- The editor passes companies_update, but the archive guard refuses the archive (only owner or admin may archive).
 select pg_temp.act_as('b0000000-0000-4000-8000-0000000000e2');
 select pg_temp.expect_count('editor reads companies after rollback (0006 policy)', 'select count(*) from public.companies', 2);
--- The editor passes companies_update and nothing refuses the archive now that guard_archive is gone (observed).
-select pg_temp.expect_count('editor archives a company after rollback (observed: guard removed)',
+select pg_temp.expect_error('editor archives a company after rollback (archive guard kept)',
+  $q$update public.companies set archived_at = now() where id = 'b6000000-0000-4000-8000-0000000000c2'$q$, '42501');
+
+-- The owner archives company c2. An archived company is then read-only for everyone, including the owner.
+select pg_temp.act_as('b0000000-0000-4000-8000-0000000000e1');
+select pg_temp.expect_count('owner archives a company after rollback',
   $q$with u as (update public.companies set archived_at = now() where id = 'b6000000-0000-4000-8000-0000000000c2' returning 1) select count(*) from u$q$, 1);
+select pg_temp.expect_error('owner edits an archived company after rollback (immutable)',
+  $q$update public.companies set name = 'changed' where id = 'b6000000-0000-4000-8000-0000000000c2'$q$, '42501');
+select pg_temp.expect_error('owner deletes an archived company after rollback (immutable)',
+  $q$delete from public.companies where id = 'b6000000-0000-4000-8000-0000000000c2'$q$, '42501');
+
+-- 4. The restore function still works for the owner (admin), is refused for the editor, and is audited.
+select pg_temp.act_as('b0000000-0000-4000-8000-0000000000e2');
+select pg_temp.expect_error('editor restores an archived company (role)',
+  $q$select public.restore_archived_record('companies', 'b6000000-0000-4000-8000-0000000000c2')$q$, '42501');
+select pg_temp.act_as('b0000000-0000-4000-8000-0000000000e1');
+select pg_temp.expect_ok('owner restores the archived company',
+  $q$select public.restore_archived_record('companies', 'b6000000-0000-4000-8000-0000000000c2')$q$);
 
 select pg_temp.act_as_postgres();
-do $$ begin raise notice 'PASS 39b_0006b_rollback_fail_closed (includes the observed archive-guard limitation)'; end $$;
+do $$
+begin
+  if not exists (select 1 from public.audit_logs a
+                  where a.action = 'restore' and a.entity = 'companies' and a.entity_id = 'b6000000-0000-4000-8000-0000000000c2') then
+    raise exception 'FAIL 4: the restore after rollback left no audit row' using errcode = 'P0100';
+  end if;
+end $$;
+
+do $$ begin raise notice 'PASS 39b_0006b_rollback_fail_closed (archive protection kept; clients and deals fail closed)'; end $$;
