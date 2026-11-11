@@ -257,4 +257,93 @@ echo "surface path complete: advisor output in $RESULTS/gtm_local_prod_surface.a
 # Path D: two real sessions race a retry on a committed database (not rolled back).
 PGHOST="$PGHOST" PGPORT="$PGPORT" "$HERE/concurrency_retry.sh" || FAIL=1
 
+# Path F: 0006b round trip, in production order. 0004b must come first: the archive guard in 0006b reads archived_at,
+# and production has no archived_* columns yet. The snapshot S0 is taken before 0006b, S1 after it, S2 after
+# 0006b_down, and S3 after the reapply. Expected: S2 differs from S0 only in the table ACL lines for companies,
+# clients and deals (the grants 0006b_down deliberately does not restore). S3 must equal S1 exactly.
+FSNAP="$HERE/0006b_state_snapshot.sql"
+new_db gtm_local_0006b
+base gtm_local_0006b
+for m in 0002_gtm_scope_keys 0003_gtm_scoped_crm_foreign_keys 0004_gtm_companies_clients_deals 0005_gtm_company_links; do
+  run gtm_local_0006b "$SUPA/migrations/$m.sql" || { echo "FAILED: path F migration $m" >&2; exit 1; }
+done
+run gtm_local_0006b "$HERE/02_live_partial_state.sql" || { echo "FAILED: path F partial state" >&2; exit 1; }
+run gtm_local_0006b "$HERE/02b_live_archive_drift.sql" || { echo "FAILED: path F archive drift" >&2; exit 1; }
+run gtm_local_0006b "$SUPA/migrations/0004b_gtm_archive_columns.sql" || { echo "FAILED: path F 0004b" >&2; exit 1; }
+MD5_F="$(baseline_md5 gtm_local_0006b)"
+snap() { "${PSQL[@]}" -At -d gtm_local_0006b -f "$FSNAP" > "$RESULTS/0006b.$1.snap.txt"; }
+snap S0
+run gtm_local_0006b "$SUPA/migrations/0006b_gtm_rls_completion.sql" || { echo "FAILED: path F 0006b apply" >&2; exit 1; }
+snap S1
+run_suite gtm_local_0006b "$SUPA/tests/gtm_scope_rls.sql" "$MD5_F" 0006b-applied || FAIL=1
+run_suite gtm_local_0006b "$HERE/30_gtm_completion_tests.sql" "$MD5_F" 0006b-applied || FAIL=1
+run_suite gtm_local_0006b "$HERE/31_crm_role_matrix_tests.sql" "$MD5_F" 0006b-applied || FAIL=1
+# 32 needs 0008 (not applied on path F); it runs on paths B and E.
+run gtm_local_0006b "$SUPA/rollbacks/0006b_down.sql" || { echo "FAILED: path F 0006b_down" >&2; exit 1; }
+snap S2
+# Assert the privileges that 0006b_down deliberately leaves revoked (anon: none; authenticated: no TRUNCATE,
+# REFERENCES, TRIGGER or MAINTAIN), and the rest of the state that must return to the baseline.
+"${PSQL[@]}" -d gtm_local_0006b -f "$HERE/37_0006b_rollback_asserts.sql" > "$RESULTS/0006b.asserts.log" 2>&1 \
+  || { echo "FAILED: path F rollback asserts (see $RESULTS/0006b.asserts.log)" >&2; tail -n 3 "$RESULTS/0006b.asserts.log" >&2; FAIL=1; }
+# Expected differences only: the table ACL lines for companies, clients and deals.
+UNEXPECTED="$(diff "$RESULTS/0006b.S0.snap.txt" "$RESULTS/0006b.S2.snap.txt" | grep '^[<>]' \
+  | grep -v -E '^[<>] table (companies|clients|deals) ' || true)"
+EXPECTED_N="$(diff "$RESULTS/0006b.S0.snap.txt" "$RESULTS/0006b.S2.snap.txt" | grep -c -E '^[<>] table (companies|clients|deals) ' || true)"
+if [ -n "$UNEXPECTED" ]; then
+  echo "FAILED: path F 0006b_down changed objects outside the expected grant set:" >&2; echo "$UNEXPECTED" >&2; FAIL=1
+elif [ "$EXPECTED_N" -eq 0 ]; then
+  echo "FAILED: path F expected the intentional grant difference and saw none (the check is blind)" >&2; FAIL=1
+else
+  echo "observed (expected): 0006b_down restores all objects except $EXPECTED_N table ACL line(s) for companies, clients, deals"
+fi
+# Reapply 0006b and rerun. S3 must equal S1 exactly, so the migration is idempotent after a rollback.
+run gtm_local_0006b "$SUPA/migrations/0006b_gtm_rls_completion.sql" || { echo "FAILED: path F 0006b reapply" >&2; exit 1; }
+snap S3
+if diff -u "$RESULTS/0006b.S1.snap.txt" "$RESULTS/0006b.S3.snap.txt"; then
+  echo "passed: path F reapply reproduces the post-0006b state exactly"
+else
+  echo "FAILED: path F reapply differs from the first post-0006b state" >&2; FAIL=1
+fi
+run_suite gtm_local_0006b "$SUPA/tests/gtm_scope_rls.sql" "$MD5_F" 0006b-reapplied || FAIL=1
+run_suite gtm_local_0006b "$HERE/30_gtm_completion_tests.sql" "$MD5_F" 0006b-reapplied || FAIL=1
+run_suite gtm_local_0006b "$HERE/31_crm_role_matrix_tests.sql" "$MD5_F" 0006b-reapplied || FAIL=1
+
+# Path G: 0010 least-privilege round trip and test 36, on a copy of the production-shaped surface. The copy is
+# taken from path E's final state, which is rolled back, so it has no 0009 or 0010 objects.
+"${PSQL[@]}" -d postgres -c "drop database if exists gtm_local_0010 with (force);"
+"${PSQL[@]}" -d postgres -c "create database gtm_local_0010 template gtm_local_prod_surface;" || { echo "FAILED: path G copy" >&2; exit 1; }
+MD5_G="$(baseline_md5 gtm_local_0010)"
+# Scale to production's table count with the fixture (names only, RLS on, no grants beyond the surface defaults).
+run gtm_local_0010 "$HERE/fixtures/production_table_names.sql" || { echo "FAILED: path G fixture" >&2; exit 1; }
+# Suite 30 is not run here: it asserts the 0006b grant state (no REFERENCES or TRIGGER for authenticated on the GTM tables),
+# which production does not have yet. Path F runs it against 0006b.
+# Target order: 0009 (anon hardening) then 0010 (TRUNCATE). The copy is taken with production's grants restored, so 0009 is
+# what removes anon's privileges here. 0010 then removes authenticated's TRUNCATE. The ACL compare starts from the state after 0009.
+"${PSQL[@]}" -1 -d gtm_local_0010 -f "$PROP" || { echo "FAILED: path G 0009 apply" >&2; exit 1; }
+run_suite gtm_local_0010 "$HERE/36_least_privilege_tests.sql" "$MD5_G" pre-0010 && { echo "UNEXPECTED: 36 passed before 0010" >&2; FAIL=1; } || echo "observed (expected): 36 fails before 0010 (authenticated still holds TRUNCATE)"
+"${PSQL[@]}" -At -d gtm_local_0010 -f "$FSNAP" > "$RESULTS/0010.acl.pre.txt"
+"${PSQL[@]}" -1 -d gtm_local_0010 -f "$SUPA/reviews/0010_gtm_least_privilege_proposed.sql" || { echo "FAILED: path G 0010 apply" >&2; exit 1; }
+"${PSQL[@]}" -At -d gtm_local_0010 -f "$FSNAP" > "$RESULTS/0010.acl.post.txt"
+python3 "$HERE/compare_0010_acl.py" "$RESULTS/0010.acl.pre.txt" "$RESULTS/0010.acl.post.txt" 56 || { echo "FAILED: path G ACL compare (SELECT/INSERT/UPDATE/DELETE must be unchanged)" >&2; FAIL=1; }
+run_suite gtm_local_0010 "$HERE/36_least_privilege_tests.sql" "$MD5_G" post-0010 || FAIL=1
+run_suite gtm_local_0010 "$HERE/33_anon_hardening_tests.sql" "$MD5_G" post-0010 || FAIL=1
+for s in gtm_scope_rls.sql:"$SUPA/tests/gtm_scope_rls.sql" 31_crm_role_matrix_tests.sql:"$HERE/31_crm_role_matrix_tests.sql" 32_clients_readiness_tests.sql:"$HERE/32_clients_readiness_tests.sql" 34_anon_rpc_compat_tests.sql:"$HERE/34_anon_rpc_compat_tests.sql"; do
+  run_suite gtm_local_0010 "${s#*:}" "$MD5_G" post-0010 || FAIL=1
+done
+"${PSQL[@]}" -1 -d gtm_local_0010 -f "$SUPA/reviews/0010_gtm_least_privilege_rollback.sql" >/dev/null 2>&1 && { echo "UNEXPECTED: 0010 rollback ran without confirmation" >&2; FAIL=1; } || echo "observed (expected): 0010 rollback refuses without confirmation"
+{ echo "select set_config('gtm.confirm_reopen_truncate', 'yes', true);"; cat "$SUPA/reviews/0010_gtm_least_privilege_rollback.sql"; } > "$RESULTS/0010_rollback_confirmed.sql"
+"${PSQL[@]}" -1 -d gtm_local_0010 -f "$RESULTS/0010_rollback_confirmed.sql" || { echo "FAILED: path G 0010 rollback" >&2; exit 1; }
+"${PSQL[@]}" -1 -d gtm_local_0010 -f "$SUPA/reviews/0010_gtm_least_privilege_proposed.sql" || { echo "FAILED: path G 0010 reapply" >&2; exit 1; }
+run_suite gtm_local_0010 "$HERE/36_least_privilege_tests.sql" "$MD5_G" post-reapply || FAIL=1
+
+# Path H: step 4 of 0009 on its own (rls_auto_enable EXECUTE removed from PUBLIC and anon). Nothing else from 0009.
+# Control first: without the fixture, 38 must fail. Then the fixture, 38 and 34 must pass.
+new_db_from_template() { "${PSQL[@]}" -d postgres -c "drop database if exists $1 with (force);" -c "create database $1 template gtm_local_prod_surface;"; }
+new_db_from_template gtm_local_rls_step4
+MD5_H="$(baseline_md5 gtm_local_rls_step4)"
+run_suite gtm_local_rls_step4 "$HERE/38_rls_auto_enable_standalone.sql" "$MD5_H" control && { echo "UNEXPECTED: 38 passed before the step 4 change" >&2; FAIL=1; } || echo "observed (expected): 38 fails before the step 4 change"
+run gtm_local_rls_step4 "$HERE/fixtures/0009_step4_only.sql" || { echo "FAILED: path H step 4 apply" >&2; exit 1; }
+run_suite gtm_local_rls_step4 "$HERE/38_rls_auto_enable_standalone.sql" "$MD5_H" step4-only || FAIL=1
+run_suite gtm_local_rls_step4 "$HERE/34_anon_rpc_compat_tests.sql" "$MD5_H" step4-only || FAIL=1
+
 exit $FAIL
