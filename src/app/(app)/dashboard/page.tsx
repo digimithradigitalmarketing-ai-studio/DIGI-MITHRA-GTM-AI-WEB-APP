@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { DemoBanner } from "@/components/demo-banner";
 import Link from "next/link";
 import { Badge, DataTable, Notice, Panel, PageHeader, StatCard } from "@/components/ui";
 import {
@@ -45,6 +46,7 @@ export default function DashboardPage() {
 
   return (
     <>
+      <DemoBanner />
       <PageHeader
         title="Dashboard"
         description={`Overview as of ${formatDate(AS_OF)}. Every figure comes from the synthetic demo records.`}

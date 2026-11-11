@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { DemoBanner } from "@/components/demo-banner";
 import { CsvDownloadButton } from "@/components/csv-download-button";
 import { Badge, DataTable, Panel, PageHeader, StatCard } from "@/components/ui";
 import { AS_OF, automationRuns, deals, leads, tasks } from "@/lib/data";
@@ -30,6 +31,7 @@ export default function ReportsPage() {
 
   return (
     <>
+      <DemoBanner />
       <PageHeader
         title="Reports"
         description={`Figures as of ${formatDate(AS_OF)}. Each metric is defined below so the numbers can be checked.`}

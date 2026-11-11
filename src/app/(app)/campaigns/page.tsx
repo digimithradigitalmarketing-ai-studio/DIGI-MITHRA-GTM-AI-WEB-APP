@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { DemoBanner } from "@/components/demo-banner";
 import { Badge, DataTable, Notice, PageHeader, Panel } from "@/components/ui";
 import { campaigns } from "@/lib/data";
 import { campaignsAwaitingApproval } from "@/lib/metrics";
@@ -11,6 +12,7 @@ export default function CampaignsPage() {
 
   return (
     <>
+      <DemoBanner />
       <PageHeader
         title="Campaigns"
         description="Draft campaigns, target segments and approval status. Nothing is sent from this screen."

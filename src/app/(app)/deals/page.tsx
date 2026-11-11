@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { DemoBanner } from "@/components/demo-banner";
 import { Badge, EmptyState, Notice, PageHeader, Panel } from "@/components/ui";
 import { AS_OF, deals, tasks } from "@/lib/data";
 import { DEAL_STAGES, dueTodayOrLater, overdueTasks } from "@/lib/metrics";
@@ -13,6 +14,7 @@ export default function DealsPage() {
 
   return (
     <>
+      <DemoBanner />
       <PageHeader
         title="Deals"
         description="Deals grouped by stage with totals. Moving a deal between stages arrives in Phase 4."
