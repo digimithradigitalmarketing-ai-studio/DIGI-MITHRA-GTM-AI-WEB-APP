@@ -21,3 +21,15 @@ export function explainError(error: DbError): string {
       return "Something went wrong. Please try again.";
   }
 }
+
+// PostgREST (PGRST202) and the database (42883) both report a function that is not installed.
+// Retry is the one feature that depends on retry_workflow_run, so a missing function means retry
+// is unavailable in this database, not that the run is broken.
+const FUNCTION_MISSING_CODES = new Set(["42883", "PGRST202"]);
+
+export function isFunctionMissing(error: DbError): boolean {
+  return FUNCTION_MISSING_CODES.has(error.code ?? "");
+}
+
+export const RETRY_UNAVAILABLE_MESSAGE =
+  "Automation retry is unavailable in this workspace until the database retry function is installed. The original failure is kept, and nothing was changed.";

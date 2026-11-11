@@ -10,7 +10,7 @@ import {
   validateFollowUpInput,
   type FieldErrors,
 } from "@/lib/automations/definition";
-import { explainError } from "@/lib/automations/errors";
+import { explainError, isFunctionMissing, RETRY_UNAVAILABLE_MESSAGE } from "@/lib/automations/errors";
 import { nextStatusFor } from "@/lib/automations/run-status";
 import { findWorkspaceAccess, type WorkspaceAccess } from "@/lib/automations/workspace";
 import { createClient } from "@/lib/supabase/server";
@@ -23,7 +23,8 @@ import { createClient } from "@/lib/supabase/server";
 // messages and keep the action from doing work the caller is not allowed to do.
 
 export type WorkflowFormState = { error?: string; errors?: FieldErrors };
-export type ActionState = { ok?: boolean; message?: string; error?: string } | null;
+// unavailable = the database feature is not installed (not a failure of the run). The button uses it to disable itself.
+export type ActionState = { ok?: boolean; message?: string; error?: string; unavailable?: boolean } | null;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -188,7 +189,10 @@ export async function retryRun(runId: string): Promise<ActionState> {
 
   // retry_workflow_run refuses anything but a failed run, and refuses a second successful retry.
   const { data: retryId, error } = await supabase.rpc("retry_workflow_run", { p_run: runId });
-  if (error) return { error: explainError(error) };
+  if (error) {
+    if (isFunctionMissing(error)) return { error: RETRY_UNAVAILABLE_MESSAGE, unavailable: true };
+    return { error: explainError(error) };
+  }
 
   revalidatePath("/automations");
   revalidatePath(`/automations/runs/${runId}`);

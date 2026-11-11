@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { explainError } from "./errors";
+import { explainError, isFunctionMissing, RETRY_UNAVAILABLE_MESSAGE } from "./errors";
 
 describe("explainError", () => {
   it("explains a refused permission without leaking database text", () => {
@@ -27,5 +27,22 @@ describe("explainError", () => {
 
   it("falls back to a generic message for anything else", () => {
     expect(explainError({ message: "connection reset" })).toBe("Something went wrong. Please try again.");
+  });
+});
+
+describe("isFunctionMissing", () => {
+  it("treats a missing function as missing, from PostgREST or the database", () => {
+    expect(isFunctionMissing({ code: "PGRST202", message: "Could not find the function" })).toBe(true);
+    expect(isFunctionMissing({ code: "42883", message: "function retry_workflow_run does not exist" })).toBe(true);
+  });
+
+  it("does not treat a refused or failed call as a missing function", () => {
+    expect(isFunctionMissing({ code: "42501", message: "permission denied" })).toBe(false);
+    expect(isFunctionMissing({ code: "22023", message: "Only failed runs can be retried" })).toBe(false);
+    expect(isFunctionMissing({ message: "connection reset" })).toBe(false);
+  });
+
+  it("explains that retry is unavailable, not that the run failed again", () => {
+    expect(RETRY_UNAVAILABLE_MESSAGE).toContain("Automation retry is unavailable");
   });
 });

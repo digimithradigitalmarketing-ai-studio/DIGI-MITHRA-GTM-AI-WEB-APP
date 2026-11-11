@@ -19,14 +19,17 @@ const VARIANT_CLASS: Record<NonNullable<Props["variant"]>, string> = {
 // and the database enforces the change, so this component only displays what came back.
 export function ActionButton({ action, label, pendingLabel, variant = "secondary" }: Props) {
   const [state, formAction, pending] = useActionState<ActionState, FormData>(action, null);
+  // Once the database reports the function is not installed, the button stays disabled and the
+  // explanation stays visible, so the user is not invited to click again.
+  const unavailable = state?.unavailable === true;
   return (
     <form action={formAction} className="flex flex-col items-start gap-2">
       <button
         type="submit"
-        disabled={pending}
+        disabled={pending || unavailable}
         className={`rounded-lg px-3.5 py-2 text-sm font-medium disabled:opacity-60 ${VARIANT_CLASS[variant]}`}
       >
-        {pending ? pendingLabel : label}
+        {pending ? pendingLabel : unavailable ? "Retry unavailable" : label}
       </button>
       {state?.error ? <p role="alert" className="text-sm text-rose-700">{state.error}</p> : null}
       {state?.ok && state.message ? <p role="status" className="text-sm text-emerald-800">{state.message}</p> : null}
