@@ -130,6 +130,7 @@ for db_md5 in "gtm_local_live_replay $MD5_A" "gtm_local_fresh $MD5_B"; do
   run_suite "$1" "$HERE/30_gtm_completion_tests.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/31_crm_role_matrix_tests.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/32_clients_readiness_tests.sql" "$2" final || FAIL=1
+  run_suite "$1" "$HERE/33_anon_hardening_tests.sql" "$2" final "$SUPA/reviews/0009_anon_hardening_proposed.sql" || FAIL=1
   run_suite "$1" "$HERE/40_automation_engine_tests.sql" "$2" final || FAIL=1
   run_suite "$1" "$HERE/41_legacy_node_regression.sql" "$2" final "$LEGACY_PRELUDE" || FAIL=1
   run_suite "$1" "$HERE/50_review_0006c_tests.sql" "$2" final "$REVIEW_PRELUDE" || FAIL=1
