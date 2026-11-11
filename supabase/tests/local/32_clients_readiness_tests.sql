@@ -42,12 +42,16 @@ begin
   end if;
 end $$;
 
--- Asserts that every flag reports the ready state (anon privilege must be false).
+-- Asserts the ready state: required flags true, every hole flag false (mirrors the TypeScript evaluator).
 create function pg_temp.expect_all_ready(p_label text) returns void language plpgsql as $$
-declare r jsonb := public.clients_readiness(); k text;
+declare
+  r jsonb := public.clients_readiness();
+  k text;
+  n integer;
+  must_be_false text[] := array['anon_has_any_privilege', 'anon_or_public_policy', 'public_execute', 'anon_execute'];
 begin
   for k in select jsonb_object_keys(r) loop
-    if k = 'anon_has_any_privilege' then
+    if k = any (must_be_false) then
       if (r ->> k)::boolean then
         raise exception 'FAIL %: % is true', p_label, k using errcode = 'P0100';
       end if;
@@ -55,6 +59,10 @@ begin
       raise exception 'FAIL %: % is false', p_label, k using errcode = 'P0100';
     end if;
   end loop;
+  select count(*) into n from jsonb_object_keys(r);
+  if n <> 15 then
+    raise exception 'FAIL %: expected 15 flags, got %', p_label, n using errcode = 'P0100';
+  end if;
 end $$;
 
 -- Drops every clients policy for one command. Runs as the owner, inside a savepoint.
@@ -155,6 +163,68 @@ select pg_temp.act_as_postgres();
 grant select on public.clients to anon;
 select pg_temp.expect_flag('anon holds select on clients', 'anon_has_any_privilege', true);
 rollback to savepoint anon_privilege;
+
+-- ----------------------------------------------------------------- policy identity (savepoints)
+-- A correct-looking policy under another name does not count: the check is by exact name.
+savepoint renamed_insert_policy;
+select pg_temp.act_as_postgres();
+select pg_temp.drop_clients_policies('INSERT');
+create policy clients_insert_renamed on public.clients for insert to authenticated
+  with check (app_private.ws_role(tenant_id, workspace_id) = any (array['admin']::text[]));
+select pg_temp.expect_flag('renamed insert policy does not count', 'policy_insert', false);
+rollback to savepoint renamed_insert_policy;
+
+-- An ALL policy named like the update policy does not count: the check is by exact command.
+savepoint all_update_policy;
+select pg_temp.act_as_postgres();
+select pg_temp.drop_clients_policies('UPDATE');
+create policy clients_update on public.clients for all to authenticated
+  using (app_private.ws_role(tenant_id, workspace_id) is not null);
+select pg_temp.expect_flag('ALL policy does not count as update', 'policy_update', false);
+rollback to savepoint all_update_policy;
+
+-- A select policy granted to PUBLIC: wrong role set, and it counts as an anon/public policy.
+savepoint public_select_policy;
+select pg_temp.act_as_postgres();
+select pg_temp.drop_clients_policies('SELECT');
+create policy clients_read on public.clients for select to public
+  using (app_private.ws_role(tenant_id, workspace_id) is not null);
+select pg_temp.expect_flag('public-role select policy does not count', 'policy_select', false);
+select pg_temp.expect_flag('public-role policy is reported', 'anon_or_public_policy', true);
+rollback to savepoint public_select_policy;
+
+-- A policy added for anon blocks readiness even when every required policy is present.
+savepoint anon_policy;
+select pg_temp.act_as_postgres();
+create policy clients_anon_probe on public.clients for select to anon using (true);
+select pg_temp.expect_flag('anon policy is reported', 'anon_or_public_policy', true);
+rollback to savepoint anon_policy;
+
+-- ----------------------------------------------------------------- function identity and EXECUTE (savepoints)
+savepoint function_definer;
+select pg_temp.act_as_postgres();
+alter function public.clients_readiness() security definer;
+select pg_temp.expect_flag('definer function is reported', 'function_security_invoker', false);
+rollback to savepoint function_definer;
+
+savepoint public_execute;
+select pg_temp.act_as_postgres();
+grant execute on function public.clients_readiness() to public;
+select pg_temp.expect_flag('PUBLIC execute is reported', 'public_execute', true);
+rollback to savepoint public_execute;
+
+savepoint anon_execute;
+select pg_temp.act_as_postgres();
+grant execute on function public.clients_readiness() to anon;
+select pg_temp.expect_flag('anon execute is reported', 'anon_execute', true);
+rollback to savepoint anon_execute;
+
+-- A TRUNCATE-only grant to anon is still a hole. The privilege list covers every table privilege.
+savepoint anon_truncate_only;
+select pg_temp.act_as_postgres();
+grant truncate on public.clients to anon;
+select pg_temp.expect_flag('anon truncate-only is reported', 'anon_has_any_privilege', true);
+rollback to savepoint anon_truncate_only;
 
 -- ----------------------------------------------------------------- empty and unauthorized data
 -- The readiness flags do not depend on the user. A user with no workspace membership still sees the

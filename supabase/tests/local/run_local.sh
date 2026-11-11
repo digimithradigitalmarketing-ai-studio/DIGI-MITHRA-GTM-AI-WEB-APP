@@ -162,6 +162,98 @@ else
   FAIL=1
 fi
 
+# Path E: the production-shaped replica (00b_production_surface.sql). Base schema, then the surface, then the
+# repo migrations in dependency order. The surface holds production's policies, grants, function bodies and
+# ACLs, the plans table, the notifications shape and the ensure_rls event trigger. 00b_production_surface.sql
+# is checked against production by catalog fingerprint (see notes, section "Replica fidelity").
+# No synthetic row is copied from production. Every fixture is rolled back.
+new_db gtm_local_prod_surface
+base gtm_local_prod_surface
+run gtm_local_prod_surface "$HERE/00b_production_surface.sql"
+MD5_E="$(baseline_md5 gtm_local_prod_surface)"
+
+# Fidelity gate 1: after 00b, the surface's policies, table grants, function bodies and function ACLs must match
+# the catalog digests captured from production (fixtures/production_digests.expected). A mismatch stops the path.
+check_digests() {  # $1 = label, $2 = sql file, $3 = check prefix
+  local out="$RESULTS/gtm_local_prod_surface.digests.$1.txt"
+  "${PSQL[@]}" -At -d gtm_local_prod_surface -f "$2" | grep "^$3|" | sort > "$out"
+  grep "^$3|" "$HERE/fixtures/production_digests.expected" | sort | diff -u - "$out" \
+    || { echo "FAILED: surface $1 digests differ from production (see diff above)" >&2; exit 1; }
+  echo "passed: surface $1 digests match production ($(wc -l < "$out") rows)"
+}
+check_digests fingerprint "$HERE/fingerprint_surface.sql" fingerprint
+# Same order production has: 0002 to 0005 (already applied to the live catalog, which is why contacts.company_id
+# exists), then the partial 0006 state and archive drift from path A, then 0006b, 0004b and the workflow migrations.
+# Any failure here stops the path: a migration error must never be silently skipped.
+for m in 0002_gtm_scope_keys 0003_gtm_scoped_crm_foreign_keys 0004_gtm_companies_clients_deals 0005_gtm_company_links; do
+  run gtm_local_prod_surface "$SUPA/migrations/$m.sql" || { echo "FAILED: surface migration $m" >&2; exit 1; }
+done
+# Fidelity gate 2: after 0005 the column sets must match production for the 12 tables checked.
+check_digests columns "$HERE/columns_surface.sql" columns
+run gtm_local_prod_surface "$HERE/02_live_partial_state.sql" || { echo "FAILED: live partial state" >&2; exit 1; }
+run gtm_local_prod_surface "$HERE/02b_live_archive_drift.sql" || { echo "FAILED: archive drift" >&2; exit 1; }
+for m in 0006b_gtm_rls_completion 0004b_gtm_archive_columns 0007a_gtm_workflow_baseline 0007_gtm_automation_engine 0008_gtm_clients_readiness; do
+  run gtm_local_prod_surface "$SUPA/migrations/$m.sql" || { echo "FAILED: surface migration $m" >&2; exit 1; }
+done
+
+# The 0009 proposal and rollback as they would run in production: one transaction each.
+PROP="$SUPA/reviews/0009_anon_hardening_proposed.sql"
+PRELUDE_RESTORE="$RESULTS/0009_restore_leads_select.sql"
+{ cat "$PROP"; echo "select set_config('gtm.restore_anon_tables', 'public.leads', true);"
+  echo "select set_config('gtm.restore_anon_privileges', 'SELECT', true);"
+  cat "$SUPA/reviews/0009_anon_hardening_rollback.sql"; } > "$PRELUDE_RESTORE"
+PRELUDE_TRUNCATE="$RESULTS/0009_restore_truncate_refused.sql"
+{ cat "$PROP"; echo "select set_config('gtm.restore_anon_tables', 'public.leads', true);"
+  echo "select set_config('gtm.restore_anon_privileges', 'TRUNCATE', true);"
+  cat "$SUPA/reviews/0009_anon_hardening_rollback.sql"; } > "$PRELUDE_TRUNCATE"
+
+# Expected failure: without the 0009 proposal the anon-hardening suite must fail on the surface, because
+# anon still holds privileges. A pass here would mean the check is blind to the production ACL.
+if run_suite gtm_local_prod_surface "$HERE/33_anon_hardening_tests.sql" "$MD5_E" pre-0009; then
+  echo "UNEXPECTED: production ACL passed 33_anon_hardening_tests.sql without the proposal" >&2
+  FAIL=1
+else
+  echo "observed (expected): production ACL fails 33_anon_hardening_tests.sql before 0009"
+fi
+
+# Negative control for suite 34: removing anon EXECUTE on a landing-page RPC must fail it.
+NEG="$RESULTS/neg_revoke_submit_landing_form.sql"
+echo "revoke execute on function public.submit_landing_form(text, jsonb, jsonb) from anon;" > "$NEG"
+if run_suite gtm_local_prod_surface "$HERE/34_anon_rpc_compat_tests.sql" "$MD5_E" neg-control "$NEG"; then
+  echo "UNEXPECTED: 34 passed with the landing form RPC revoked from anon" >&2
+  FAIL=1
+else
+  echo "observed (expected): 34 fails when anon loses the landing form RPC"
+fi
+
+# Final suites on the surface, before and after the proposal. 34 must pass in both states.
+run_suite gtm_local_prod_surface "$SUPA/tests/gtm_scope_rls.sql" "$MD5_E" final || FAIL=1
+run_suite gtm_local_prod_surface "$HERE/30_gtm_completion_tests.sql" "$MD5_E" final || FAIL=1
+run_suite gtm_local_prod_surface "$HERE/31_crm_role_matrix_tests.sql" "$MD5_E" final || FAIL=1
+run_suite gtm_local_prod_surface "$HERE/32_clients_readiness_tests.sql" "$MD5_E" final || FAIL=1
+run_suite gtm_local_prod_surface "$HERE/34_anon_rpc_compat_tests.sql" "$MD5_E" pre-0009 || FAIL=1
+run_suite gtm_local_prod_surface "$HERE/33_anon_hardening_tests.sql" "$MD5_E" post-0009 "$PROP" || FAIL=1
+run_suite gtm_local_prod_surface "$HERE/34_anon_rpc_compat_tests.sql" "$MD5_E" post-0009 "$PROP" || FAIL=1
+run_suite gtm_local_prod_surface "$HERE/35_anon_rollback_tests.sql" "$MD5_E" restore-leads-select "$PRELUDE_RESTORE" || FAIL=1
+run_suite gtm_local_prod_surface "$HERE/40_automation_engine_tests.sql" "$MD5_E" final || FAIL=1
+run_suite gtm_local_prod_surface "$HERE/41_legacy_node_regression.sql" "$MD5_E" final "$LEGACY_PRELUDE" || FAIL=1
+run_suite gtm_local_prod_surface "$HERE/50_review_0006c_tests.sql" "$MD5_E" final "$REVIEW_PRELUDE" || FAIL=1
+
+# Refusal: the rollback must refuse TRUNCATE. A pass here would mean the allow-list is not enforced.
+if { echo "begin;"; cat "$PRELUDE_TRUNCATE"; echo "rollback;"; } | "${PSQL[@]}" -d gtm_local_prod_surface -f - >"$RESULTS/gtm_local_prod_surface.0009_truncate_refused.log" 2>&1; then
+  echo "UNEXPECTED: 0009 rollback accepted TRUNCATE" >&2
+  FAIL=1
+else
+  echo "passed: 0009 rollback refuses TRUNCATE"
+fi
+
+# Emulated advisor, recorded before and after the proposal. Read-only queries; the post run is rolled back.
+{ echo "begin;"; cat "$SUPA/reviews/0009_emulated_advisor.sql"; echo "rollback;"; } \
+  | "${PSQL[@]}" -d gtm_local_prod_surface -f - > "$RESULTS/gtm_local_prod_surface.advisor_pre.txt" 2>&1 || FAIL=1
+{ echo "begin;"; cat "$PROP"; cat "$SUPA/reviews/0009_emulated_advisor.sql"; echo "rollback;"; } \
+  | "${PSQL[@]}" -d gtm_local_prod_surface -f - > "$RESULTS/gtm_local_prod_surface.advisor_post.txt" 2>&1 || FAIL=1
+echo "surface path complete: advisor output in $RESULTS/gtm_local_prod_surface.advisor_{pre,post}.txt"
+
 # Path D: two real sessions race a retry on a committed database (not rolled back).
 PGHOST="$PGHOST" PGPORT="$PGPORT" "$HERE/concurrency_retry.sh" || FAIL=1
 

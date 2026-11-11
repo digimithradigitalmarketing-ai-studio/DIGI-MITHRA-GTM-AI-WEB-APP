@@ -19,14 +19,16 @@ end $$;
 
 -- ----------------------------------------------------------------- fixtures
 -- Minimal inbox tables, columns as written by the engine (0007a run_workflow).
-create table public.conversations (
+-- 'if not exists': on the production-shaped surface (00b) these tables already exist with production's columns, which
+-- are a superset of these, so the engine test runs against production's shape there.
+create table if not exists public.conversations (
   id uuid primary key default gen_random_uuid(),
   tenant_id uuid not null,
   workspace_id uuid not null,
   contact_id uuid,
   priority text not null default 'normal'
 );
-create table public.messages (
+create table if not exists public.messages (
   id uuid primary key default gen_random_uuid(),
   tenant_id uuid not null,
   workspace_id uuid not null,

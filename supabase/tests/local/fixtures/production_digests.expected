@@ -1,0 +1,20 @@
+# Catalog digests captured read-only from production (project siyxkombexmowlggxlrb) on 2026-11-11.
+# Format: <check>|<count>|<md5>. The harness compares these with the surface replica.
+# fingerprint: checked after 00b_production_surface.sql, using fingerprint_surface.sql.
+# columns: checked after 0005 (the live state already has contacts.company_id and leads.company_id), using columns_surface.sql.
+fingerprint|policy|36|752b9d5fb6e3ff3e4f0e1f4267cdc275
+fingerprint|grant|320|ededfd3c68d894aa4f9114f2f83fcbab
+fingerprint|fn|10|27a0e828e0535ed0e17eb7d41829041e
+fingerprint|fnacl|10|76a965d86b6d6d89b1677a48419222b9
+columns|consent_records|8|845e8c0564d59248ec64b26aeda05bf5
+columns|contacts|16|56e5ba14e3bfb728949f071815373cfc
+columns|conversations|17|c05cf554ef9871c28baa358bd7f0575c
+columns|email_sends|10|8d00d30187ce7cb45314f77b9ea40ee3
+columns|form_submissions|9|e13f5b1a4b1633139bc4e71900a72b96
+columns|landing_pages|22|1bc650da1c7e6794cfd7b55123fe30e2
+columns|leads|19|437f814b4af6108c0f2687eb105a12f8
+columns|messages|11|88699b655ebc8a8d6d513aaa49810690
+columns|notifications|8|9168a357d7a1ca4dfcd3ec26d2a767ce
+columns|pipeline_stages|8|ebfb23778b98056e7b723b372e85b916
+columns|plans|10|0b9c08457683d010356f2197d8b948b2
+columns|workspaces|9|3a22899fb216bf1948a00510a882fcce

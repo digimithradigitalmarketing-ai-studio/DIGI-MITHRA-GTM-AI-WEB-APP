@@ -1,13 +1,13 @@
-// Clients readiness. The database answers one read-only question through public.clients_readiness()
-// (migration 0008): is the table present, is RLS on, do the policies and grants exist. The function
-// returns booleans only. This module turns those booleans into a state the screens can act on, and
-// it never shows the flags or any SQL to users.
+// Clients readiness, pure logic. No server imports, so unit tests load this file directly.
 //
-// Why it matters: if the clients policies are missing, reads return zero rows with no error. A page
-// would show "No clients yet" for a workspace that actually has clients. The readiness check keeps
-// that case separate from real empty data.
+// The database answers through public.clients_readiness() (migration 0008). It returns booleans only.
+// This module turns them into a state the screens can act on. It never shows the flags or any SQL.
+//
+// Why it matters: if the clients policies are missing, reads return zero rows with no error, which
+// looks exactly like a workspace with no clients. The readiness check keeps those apart.
 
-export const CLIENTS_READINESS_FLAGS = [
+// Flags that must be true for the module to be ready.
+export const CLIENTS_READINESS_REQUIRED_TRUE = [
   "table_exists",
   "rls_enabled",
   "policy_select",
@@ -18,16 +18,26 @@ export const CLIENTS_READINESS_FLAGS = [
   "grant_insert",
   "grant_update",
   "grant_delete",
-  "anon_has_any_privilege",
+  "function_security_invoker",
 ] as const;
+
+// Flags that must be false. Each one is a hole that lets anonymous callers in.
+export const CLIENTS_READINESS_MUST_BE_FALSE = [
+  "anon_has_any_privilege",
+  "anon_or_public_policy",
+  "public_execute",
+  "anon_execute",
+] as const;
+
+export const CLIENTS_READINESS_FLAGS = [...CLIENTS_READINESS_REQUIRED_TRUE, ...CLIENTS_READINESS_MUST_BE_FALSE] as const;
 
 export type ClientsReadinessFlags = Record<(typeof CLIENTS_READINESS_FLAGS)[number], boolean>;
 
 export type ClientsReadiness =
   | { state: "ready" }
-  // Something required is missing or too open: the table, RLS, a policy, a grant, or an anon privilege.
+  // A required piece is missing, or an anonymous path is open. Shown as "Clients module not configured".
   | { state: "not_configured" }
-  // The check itself failed or returned an unexpected shape. Fail closed, but do not claim the module is unset.
+  // The check failed or returned an unexpected shape. Fail closed, and do not claim the module is unset.
   | { state: "unavailable" };
 
 export const CLIENTS_NOT_CONFIGURED_TITLE = "Clients module not configured";
@@ -41,26 +51,12 @@ function isFlagRecord(raw: unknown): raw is ClientsReadinessFlags {
   return CLIENTS_READINESS_FLAGS.every((key) => typeof record[key] === "boolean");
 }
 
-// Pure. Requires every flag to be a boolean; anything else is "unavailable", not "ready".
+// Pure. Every flag must be a boolean. Anything else is "unavailable", never "ready".
 export function evaluateClientsReadiness(raw: unknown): ClientsReadiness {
   if (!isFlagRecord(raw)) return { state: "unavailable" };
-  const f = raw;
-  const required = [
-    f.table_exists,
-    f.rls_enabled,
-    f.policy_select,
-    f.policy_insert,
-    f.policy_update,
-    f.policy_delete,
-    f.grant_select,
-    f.grant_insert,
-    f.grant_update,
-    f.grant_delete,
-  ];
-  if (!required.every(Boolean)) return { state: "not_configured" };
-  // anon must hold no table privilege on clients. Any grant there is a configuration problem.
-  if (f.anon_has_any_privilege) return { state: "not_configured" };
-  return { state: "ready" };
+  const required = CLIENTS_READINESS_REQUIRED_TRUE.every((key) => raw[key] === true);
+  const blocked = CLIENTS_READINESS_MUST_BE_FALSE.some((key) => raw[key] === true);
+  return required && !blocked ? { state: "ready" } : { state: "not_configured" };
 }
 
 // Pure. Returns the message a write action should show, or null when the write may proceed.
@@ -73,8 +69,8 @@ export type ClientListState = "not_configured" | "unavailable" | "permission_den
 
 // Pure. Decides what a Clients list should show. Order matters:
 //   1. Readiness first. A missing policy must never look like empty data.
-//   2. No workspace role means the user cannot read this workspace's clients.
-//   3. A database error on the list read is either a permission refusal (42501) or a generic failure.
+//   2. No workspace role means this user cannot read the workspace's clients (checked separately from data).
+//   3. A 42501 on the list read is a permission refusal. Any other error is a generic failure.
 //   4. Only a clean read with zero rows is "empty".
 export function classifyClientList(input: {
   readiness: ClientsReadiness;

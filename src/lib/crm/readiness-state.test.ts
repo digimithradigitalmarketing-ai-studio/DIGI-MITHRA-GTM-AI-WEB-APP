@@ -8,6 +8,7 @@ import {
   type ClientsReadinessFlags,
 } from "./readiness-state";
 
+// The fixture a correctly configured database returns.
 function flags(overrides: Partial<ClientsReadinessFlags> = {}): ClientsReadinessFlags {
   const base: ClientsReadinessFlags = {
     table_exists: true,
@@ -20,7 +21,11 @@ function flags(overrides: Partial<ClientsReadinessFlags> = {}): ClientsReadiness
     grant_insert: true,
     grant_update: true,
     grant_delete: true,
+    function_security_invoker: true,
     anon_has_any_privilege: false,
+    anon_or_public_policy: false,
+    public_execute: false,
+    anon_execute: false,
   };
   return { ...base, ...overrides };
 }
@@ -30,12 +35,12 @@ const NOT_CONFIGURED: ClientsReadiness = { state: "not_configured" };
 const UNAVAILABLE: ClientsReadiness = { state: "unavailable" };
 
 describe("evaluateClientsReadiness", () => {
-  it("is ready when the table, RLS, all four policies and grants are present", () => {
+  it("is ready when every required flag is true and every hole flag is false", () => {
     expect(evaluateClientsReadiness(flags())).toEqual(READY);
   });
 
-  it("is not configured when a write policy is missing", () => {
-    for (const key of ["policy_insert", "policy_update", "policy_delete", "policy_select"] as const) {
+  it("is not configured when any named policy is missing", () => {
+    for (const key of ["policy_select", "policy_insert", "policy_update", "policy_delete"] as const) {
       expect(evaluateClientsReadiness(flags({ [key]: false }))).toEqual(NOT_CONFIGURED);
     }
   });
@@ -49,22 +54,41 @@ describe("evaluateClientsReadiness", () => {
     expect(evaluateClientsReadiness(flags({ grant_insert: false }))).toEqual(NOT_CONFIGURED);
   });
 
-  it("is not configured when anon holds any privilege on clients", () => {
+  it("is not configured when the readiness function is not SECURITY INVOKER", () => {
+    expect(evaluateClientsReadiness(flags({ function_security_invoker: false }))).toEqual(NOT_CONFIGURED);
+  });
+
+  it("is not configured when anon holds any table privilege on clients", () => {
     expect(evaluateClientsReadiness(flags({ anon_has_any_privilege: true }))).toEqual(NOT_CONFIGURED);
   });
 
-  it("is unavailable, not ready, when the payload is malformed", () => {
+  it("is not configured when a policy applies to anon or PUBLIC", () => {
+    expect(evaluateClientsReadiness(flags({ anon_or_public_policy: true }))).toEqual(NOT_CONFIGURED);
+  });
+
+  it("is not configured when PUBLIC or anon can still execute the readiness function", () => {
+    expect(evaluateClientsReadiness(flags({ public_execute: true }))).toEqual(NOT_CONFIGURED);
+    expect(evaluateClientsReadiness(flags({ anon_execute: true }))).toEqual(NOT_CONFIGURED);
+  });
+
+  it("is unavailable, never ready, when the payload is malformed", () => {
     expect(evaluateClientsReadiness(null)).toEqual(UNAVAILABLE);
     expect(evaluateClientsReadiness("ok")).toEqual(UNAVAILABLE);
     expect(evaluateClientsReadiness([])).toEqual(UNAVAILABLE);
     const missing: Partial<ClientsReadinessFlags> = { ...flags() };
-    delete missing.policy_delete;
+    delete missing.anon_execute;
     expect(evaluateClientsReadiness(missing)).toEqual(UNAVAILABLE);
     expect(evaluateClientsReadiness({ ...flags(), rls_enabled: "true" })).toEqual(UNAVAILABLE);
   });
 
-  it("covers every flag the SQL function returns", () => {
-    expect(CLIENTS_READINESS_FLAGS).toHaveLength(11);
+  it("requires a boolean for a hole flag too, so a missing check cannot pass", () => {
+    const withoutCheck: Partial<ClientsReadinessFlags> = { ...flags() };
+    delete withoutCheck.public_execute;
+    expect(evaluateClientsReadiness(withoutCheck)).toEqual(UNAVAILABLE);
+  });
+
+  it("covers the fifteen flags the SQL function returns", () => {
+    expect(CLIENTS_READINESS_FLAGS).toHaveLength(15);
   });
 });
 
@@ -101,7 +125,7 @@ describe("classifyClientList", () => {
     expect(classifyClientList({ ...base, readiness: UNAVAILABLE })).toBe("unavailable");
   });
 
-  it("reports permission denied for a user with no workspace role", () => {
+  it("reports permission denied for a user with no workspace role, even when the module is ready", () => {
     expect(classifyClientList({ ...base, hasAccess: false, rowCount: 0 })).toBe("permission_denied");
   });
 
